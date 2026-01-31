@@ -4,7 +4,7 @@ import numpy as np
 
 st.set_page_config(page_title="Challenge 02 - DSS", layout="wide")
 st.title("Challenge 02 — DSS Auditable (RAW / CLEAN / ANOMALÍAS)")
-st.caption("Inicio: Inventario Central. Luego replicamos patrón para Transacciones y Feedback.")
+st.caption("Inicio: Inventario Central. Suba el archivo desde el botón o use la ruta por defecto.")
 
 # ==========
 # Helpers
@@ -41,16 +41,19 @@ def audit_summary(df_raw, df_clean, df_anom, damage_cols, flag_cols):
 
 
 # ==========
-# Sidebar: Selección de archivo (por ahora inventario)
+# Sidebar: Upload / Source
 # ==========
-st.sidebar.header("1) Archivo")
-inventory_path = st.sidebar.text_input(
-    "Ruta inventario",
-    value="/mnt/data/inventario_central_v2.csv"
+st.sidebar.header("1) Cargar archivo (Inventario)")
+uploaded_inv = st.sidebar.file_uploader(
+    "Sube inventario_central_v2.csv",
+    type=["csv"]
 )
 
+use_default = st.sidebar.checkbox("Si no subo archivo, usar ruta por defecto", value=True)
+default_path = st.sidebar.text_input("Ruta por defecto (opcional)", value="/mnt/data/inventario_central_v2.csv")
+
 # ==========
-# Sidebar: Checklists (Decisiones)
+# Sidebar: Checklists (Decisiones Inventario)
 # ==========
 st.sidebar.header("2) Decisiones del cliente (Inventario)")
 
@@ -88,24 +91,42 @@ send_flags_to_anom = st.sidebar.checkbox(
 )
 
 # ==========
-# Load data
+# Load inventory
 # ==========
 @st.cache_data(show_spinner=False)
-def load_inventory(path):
+def load_from_upload(uploaded_file) -> pd.DataFrame:
+    return pd.read_csv(uploaded_file)
+
+@st.cache_data(show_spinner=False)
+def load_from_path(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
+inv_raw = None
+source_label = ""
+
 try:
-    inv_raw = load_inventory(inventory_path)
+    if uploaded_inv is not None:
+        inv_raw = load_from_upload(uploaded_inv)
+        source_label = "Archivo subido por el usuario"
+    else:
+        if use_default:
+            inv_raw = load_from_path(default_path)
+            source_label = f"Ruta por defecto: {default_path}"
 except Exception as e:
-    st.error(f"No pude cargar el archivo. Revisa la ruta y formato. Error: {e}")
+    st.error(f"No pude cargar el archivo. Error: {e}")
     st.stop()
+
+if inv_raw is None:
+    st.warning("Sube el archivo de inventario para iniciar, o activa la ruta por defecto.")
+    st.stop()
+
+st.success(f"Inventario cargado ✅ ({source_label})")
 
 # ==========
 # Step A: Tipificación mínima (sin borrar filas)
 # ==========
 inv = inv_raw.copy()
 
-# Intenta tipificar si existen las columnas esperadas
 if "Stock_Actual" in inv.columns:
     inv["Stock_Actual"] = to_numeric(inv["Stock_Actual"])
 if "Costo_Unitario_USD" in inv.columns:
@@ -118,12 +139,9 @@ if "Ultima_Revision" in inv.columns:
     inv["Ultima_Revision"] = to_datetime(inv["Ultima_Revision"])
 
 # ==========
-# Step B: Generación de "damage__" (daños por columna)
+# Step B: damages y flags
 # ==========
-# Damage = cosas que impiden usar el dato (nulo/ilegible)
-# Flag = cosas "raras" o de riesgo (negativo, outlier, futuro)
-damage_cols = []
-flag_cols = []
+damage_cols, flag_cols = [], []
 
 def add_damage(colname, mask):
     cname = f"damage__{colname}"
@@ -135,39 +153,31 @@ def add_flag(flagname, mask):
     inv[cname] = mask.astype(bool)
     flag_cols.append(cname)
 
-# SKU_ID
 if "SKU_ID" in inv.columns:
     add_damage("SKU_ID", inv["SKU_ID"].isna())
 
-# Stock_Actual
 if "Stock_Actual" in inv.columns:
     add_damage("Stock_Actual", inv["Stock_Actual"].isna())
     add_flag("stock_negativo", inv["Stock_Actual"] < 0)
 
-# Costo_Unitario_USD
 if "Costo_Unitario_USD" in inv.columns:
     add_damage("Costo_Unitario_USD", inv["Costo_Unitario_USD"].isna())
     add_flag("costo_no_positivo", inv["Costo_Unitario_USD"] <= 0)
 
-# Lead_Time_Dias
 if "Lead_Time_Dias" in inv.columns:
     add_damage("Lead_Time_Dias", inv["Lead_Time_Dias"].isna())
     add_flag("leadtime_negativo", inv["Lead_Time_Dias"] < 0)
 
-# Punto_Reorden
 if "Punto_Reorden" in inv.columns:
     add_damage("Punto_Reorden", inv["Punto_Reorden"].isna())
     add_flag("punto_reorden_negativo", inv["Punto_Reorden"] < 0)
 
-# Ultima_Revision
 if "Ultima_Revision" in inv.columns:
     add_damage("Ultima_Revision", inv["Ultima_Revision"].isna())
     today = pd.Timestamp.today().normalize()
     add_flag("fecha_revision_futura", inv["Ultima_Revision"] > today)
 
-# ==========
-# Step C: Outliers (Costo y LeadTime) como flags
-# ==========
+# Outliers como flags
 def compute_outlier_flag(col, flagname):
     if col not in inv.columns:
         return
@@ -186,33 +196,21 @@ def compute_outlier_flag(col, flagname):
 compute_outlier_flag("Costo_Unitario_USD", "costo_outlier")
 compute_outlier_flag("Lead_Time_Dias", "leadtime_outlier")
 
-# ==========
-# Step D: Score de daño por fila
-# ==========
-if damage_cols:
-    inv["damaged_cols_count"] = inv[damage_cols].sum(axis=1)
-else:
-    inv["damaged_cols_count"] = 0
-
-if flag_cols:
-    inv["any_flag"] = inv[flag_cols].any(axis=1)
-else:
-    inv["any_flag"] = False
+# Daños por fila
+inv["damaged_cols_count"] = inv[damage_cols].sum(axis=1) if damage_cols else 0
+inv["any_flag"] = inv[flag_cols].any(axis=1) if flag_cols else False
 
 # ==========
-# Step E: Split RAW / ANOMALIES / CLEAN
+# Split RAW / CLEAN / ANOMALÍAS
 # ==========
 base_anom_mask = inv["damaged_cols_count"] >= int(damage_threshold)
-if send_flags_to_anom:
-    anom_mask = base_anom_mask | inv["any_flag"]
-else:
-    anom_mask = base_anom_mask
+anom_mask = (base_anom_mask | inv["any_flag"]) if send_flags_to_anom else base_anom_mask
 
 inv_anom = inv[anom_mask].copy()
 inv_clean = inv[~anom_mask].copy()
 
 # ==========
-# Step F: Imputación SOLO en CLEAN (opcional)
+# Imputación SOLO en CLEAN
 # ==========
 def group_median_impute(df, target_col, group_col):
     if target_col not in df.columns or group_col not in df.columns:
@@ -232,14 +230,12 @@ def global_median_impute(df, target_col):
     df[f"imputed__{target_col}"] = was_null.astype(bool)
     return df
 
-# Lead_Time_Dias
 if "Lead_Time_Dias" in inv_clean.columns:
     if impute_lead == "Mediana global":
         inv_clean = global_median_impute(inv_clean, "Lead_Time_Dias")
     elif impute_lead == "Mediana por categoría" and "Categoria" in inv_clean.columns:
         inv_clean = group_median_impute(inv_clean, "Lead_Time_Dias", "Categoria")
 
-# Punto_Reorden
 if "Punto_Reorden" in inv_clean.columns:
     if impute_reorder == "Mediana global":
         inv_clean = global_median_impute(inv_clean, "Punto_Reorden")
@@ -247,7 +243,7 @@ if "Punto_Reorden" in inv_clean.columns:
         inv_clean = group_median_impute(inv_clean, "Punto_Reorden", "Categoria")
 
 # ==========
-# UI: Tabs (Inventario)
+# UI
 # ==========
 tab1, tab2, tab3 = st.tabs(["📋 Auditoría", "✅ CLEAN", "⚠️ ANOMALÍAS"])
 
@@ -256,7 +252,10 @@ with tab1:
     st.dataframe(audit_summary(inv, inv_clean, inv_anom, damage_cols, flag_cols), use_container_width=True)
 
     st.markdown("### Top columnas con más nulos (RAW tipificado)")
-    st.dataframe(inv.isna().mean().sort_values(ascending=False).head(15).to_frame("% nulos").mul(100), use_container_width=True)
+    st.dataframe(
+        inv.isna().mean().sort_values(ascending=False).head(15).to_frame("% nulos").mul(100),
+        use_container_width=True
+    )
 
     st.markdown("### Conteo de flags (riesgos)")
     if flag_cols:
@@ -271,11 +270,10 @@ with tab1:
 
 with tab2:
     st.subheader("Inventario CLEAN (para KPIs)")
-    st.caption("Aquí viven los datos “seguros” para análisis. Si imputaste algo, queda marcado.")
+    st.caption("Datos seguros para análisis. Las imputaciones quedan marcadas con columnas imputed__*.")
     st.dataframe(inv_clean.head(200), use_container_width=True)
 
 with tab3:
-    st.subheader("Inventario ANOMALÍAS (riesgos / outliers / daños)")
-    st.caption("Aquí viven los registros excluidos de KPIs, pero útiles para diagnóstico y storytelling.")
+    st.subheader("Inventario ANOMALÍAS (riesgo / outliers / daños)")
+    st.caption("Registros excluidos de KPIs, pero útiles para diagnóstico y storytelling.")
     st.dataframe(inv_anom.head(200), use_container_width=True)
-
