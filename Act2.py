@@ -455,3 +455,161 @@ with tab4:
                             "Punto_Reorden", "Lead_Time_Dias", "Bodega_Origen_clean", "Ultima_Revision"]
                  if c in inv_anom.columns]
     st.dataframe(inv_anom[preferred + [c for c in inv_anom.columns if c not in preferred]].head(200), use_container_width=True)
+# ======================================================
+# ================= TRANSACCIONES ======================
+# ======================================================
+
+st.markdown("---")
+st.header("🚚 Limpieza de Transacciones Logísticas")
+
+# ---------- Sidebar ----------
+st.sidebar.header("🚚 Limpieza Transacciones")
+
+uploaded_tx = st.sidebar.file_uploader(
+    "Sube transacciones_logistica_v2.csv",
+    type=["csv"],
+    key="tx_uploader"
+)
+
+if uploaded_tx is None:
+    st.info("Sube el archivo de transacciones para iniciar esta sección.")
+else:
+    @st.cache_data(show_spinner=False)
+    def load_tx(uploaded_file):
+        return pd.read_csv(uploaded_file)
+
+    tx_raw = load_tx(uploaded_tx)
+    st.success("Transacciones cargadas ✅")
+
+    with st.sidebar.expander("Reglas de ANOMALÍAS (Transacciones)", expanded=True):
+        tx_damage_threshold = st.number_input(
+            "Enviar fila a ANOMALÍAS si columnas dañadas ≥",
+            1, 10, 2,
+            key="tx_damage_threshold"
+        )
+        tx_send_flags_to_anom = st.checkbox(
+            "Enviar a ANOMALÍAS si tiene cualquier flag",
+            value=True,
+            key="tx_send_flags"
+        )
+
+    # ---------- Copia base ----------
+    tx = tx_raw.copy()
+
+    # ---------- Normalización automática ----------
+    CITY_MAP = {
+        "bogota": "bogota",
+        "bog": "bogota",
+        "medellin": "medellin",
+        "med": "medellin",
+        "mde": "medellin",
+        "cali": "cali",
+        "unknown": "unknown",
+    }
+
+    if "Ciudad_Destino" in tx.columns:
+        tx["Ciudad_Destino_original"] = tx["Ciudad_Destino"].astype("string")
+        tx["Ciudad_Destino_clean"] = tx["Ciudad_Destino"].apply(normalize_text_keep_unknown)
+        tx["Ciudad_Destino_clean"] = apply_manual_map(tx["Ciudad_Destino_clean"], CITY_MAP)
+
+        canonical_city = build_canonical_values(tx["Ciudad_Destino_clean"])
+        tx["Ciudad_Destino_clean"], _ = fuzzy_map_unique(
+            tx["Ciudad_Destino_clean"], canonical_city, threshold=0.92, delta=0.03
+        )
+
+    if "Estado_Envio" in tx.columns:
+        tx["Estado_Envio_original"] = tx["Estado_Envio"].astype("string")
+        tx["Estado_Envio_clean"] = tx["Estado_Envio"].apply(normalize_text_keep_unknown)
+
+    # ---------- Tipificación ----------
+    if "Fecha_Envio" in tx.columns:
+        tx["Fecha_Envio"] = to_datetime(tx["Fecha_Envio"])
+    if "Fecha_Entrega" in tx.columns:
+        tx["Fecha_Entrega"] = to_datetime(tx["Fecha_Entrega"])
+    if "Costo_Envio_USD" in tx.columns:
+        tx["Costo_Envio_USD"] = to_numeric(tx["Costo_Envio_USD"])
+    if "Tiempo_Entrega_Dias" in tx.columns:
+        tx["Tiempo_Entrega_Dias"] = to_numeric(tx["Tiempo_Entrega_Dias"])
+
+    # ---------- Daños y flags ----------
+    tx_damage_cols, tx_flag_cols = [], []
+
+    def tx_add_damage(colname, mask):
+        cname = f"damage__{colname}"
+        tx[cname] = mask.astype(int)
+        tx_damage_cols.append(cname)
+
+    def tx_add_flag(flagname, mask):
+        cname = f"flag__{flagname}"
+        tx[cname] = mask.astype(bool)
+        tx_flag_cols.append(cname)
+
+    # Identidad
+    if "Transaccion_ID" in tx.columns:
+        tx_add_damage("Transaccion_ID", tx["Transaccion_ID"].isna())
+
+    # Fechas
+    if "Fecha_Envio" in tx.columns:
+        tx_add_damage("Fecha_Envio", tx["Fecha_Envio"].isna())
+
+    if "Fecha_Entrega" in tx.columns:
+        tx_add_damage("Fecha_Entrega", tx["Fecha_Entrega"].isna())
+        tx_add_flag("entrega_antes_envio",
+                    tx["Fecha_Entrega"] < tx["Fecha_Envio"])
+
+    today = pd.Timestamp.today().normalize()
+    if "Fecha_Envio" in tx.columns:
+        tx_add_flag("envio_futuro", tx["Fecha_Envio"] > today)
+    if "Fecha_Entrega" in tx.columns:
+        tx_add_flag("entrega_futura", tx["Fecha_Entrega"] > today)
+
+    # Costos
+    if "Costo_Envio_USD" in tx.columns:
+        tx_add_damage("Costo_Envio_USD", tx["Costo_Envio_USD"].isna())
+        tx_add_flag("costo_no_positivo", tx["Costo_Envio_USD"] <= 0)
+
+    # Tiempo entrega
+    if "Tiempo_Entrega_Dias" in tx.columns:
+        tx_add_damage("Tiempo_Entrega_Dias", tx["Tiempo_Entrega_Dias"].isna())
+        tx_add_flag("tiempo_negativo", tx["Tiempo_Entrega_Dias"] < 0)
+
+    # Ciudad
+    if "Ciudad_Destino_clean" in tx.columns:
+        tx_add_flag("ciudad_unknown", tx["Ciudad_Destino_clean"] == "unknown")
+
+    # ---------- Conteos ----------
+    tx["damaged_cols_count"] = tx[tx_damage_cols].sum(axis=1) if tx_damage_cols else 0
+    tx["any_flag"] = tx[tx_flag_cols].any(axis=1) if tx_flag_cols else False
+
+    # ---------- Split ----------
+    tx_base_anom = tx["damaged_cols_count"] >= int(tx_damage_threshold)
+    tx_anom_mask = (tx_base_anom | tx["any_flag"]) if tx_send_flags_to_anom else tx_base_anom
+
+    tx_anom = tx[tx_anom_mask].copy()
+    tx_clean = tx[~tx_anom_mask].copy()
+
+    # ---------- UI ----------
+    tx_tab1, tx_tab2, tx_tab3 = st.tabs(
+        ["📋 Auditoría Transacciones", "✅ CLEAN Transacciones", "⚠️ ANOMALÍAS Transacciones"]
+    )
+
+    with tx_tab1:
+        st.subheader("Auditoría de Transacciones")
+        st.dataframe(
+            audit_summary(tx, tx_clean, tx_anom, tx_damage_cols, tx_flag_cols),
+            use_container_width=True
+        )
+
+        st.markdown("### Conteo de flags")
+        st.dataframe(
+            tx[tx_flag_cols].sum().sort_values(ascending=False).to_frame("conteo"),
+            use_container_width=True
+        )
+
+    with tx_tab2:
+        st.subheader("Transacciones CLEAN")
+        st.dataframe(tx_clean.head(200), use_container_width=True)
+
+    with tx_tab3:
+        st.subheader("Transacciones ANOMALÍAS")
+        st.dataframe(tx_anom.head(200), use_container_width=True)
