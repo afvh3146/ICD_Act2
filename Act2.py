@@ -467,7 +467,6 @@ with tab4:
 st.markdown("---")
 st.header("🚚 Limpieza de Transacciones Logísticas")
 
-# Sidebar section
 st.sidebar.header("🚚 Limpieza Transacciones")
 uploaded_tx = st.sidebar.file_uploader(
     "Sube transacciones_logistica_v2.csv",
@@ -479,21 +478,17 @@ with st.sidebar.expander("Reglas de ANOMALÍAS (Transacciones)", expanded=True):
     tx_damage_threshold = st.number_input(
         "Enviar fila a ANOMALÍAS si columnas dañadas ≥",
         min_value=1, max_value=10, value=2,
-        key="tx_damage_threshold_v1"
+        key="tx_damage_threshold_v2"
     )
     tx_send_flags_to_anom = st.checkbox(
         "Enviar a ANOMALÍAS si tiene cualquier flag",
         value=True,
-        key="tx_send_flags_v1"
+        key="tx_send_flags_v2"
     )
 
-# Mensaje claro (si no han subido archivo)
 if uploaded_tx is None:
-    st.info("👈 Sube el archivo **transacciones_logistica_v2.csv** en la barra lateral para ver la auditoría y flags.")
+    st.info("👈 Sube el archivo **transacciones_logistica_v2.csv** en la barra lateral para ver auditoría y flags.")
 else:
-    # -------------------------
-    # Load CSV
-    # -------------------------
     @st.cache_data(show_spinner=False)
     def load_tx(uploaded_file):
         return pd.read_csv(uploaded_file)
@@ -506,73 +501,52 @@ else:
 
     st.success(f"Transacciones cargadas ✅  | Filas: {len(tx_raw):,}  | Columnas: {len(tx_raw.columns)}")
 
-    # Preview SIEMPRE visible (para confirmar que cargó)
-    with st.expander("👀 Vista previa (RAW)", expanded=True):
+    with st.expander("👀 Vista previa (RAW)", expanded=False):
         st.dataframe(tx_raw.head(50), use_container_width=True)
 
     # -------------------------
-    # Helpers locales (robustos)
+    # Helpers locales
     # -------------------------
-    def find_col(df: pd.DataFrame, candidates):
-        cols = list(df.columns)
-        cols_lower = {c.lower(): c for c in cols}
-        for cand in candidates:
-            if cand in cols:
-                return cand
-            lc = str(cand).lower()
-            if lc in cols_lower:
-                return cols_lower[lc]
-        return None
-
     def to_numeric_loose(s: pd.Series) -> pd.Series:
-        if s is None:
-            return s
+        """Convierte números tolerando símbolos y comas."""
         ss = s.astype("string")
-
-        # quita símbolos monetarios y texto común
         ss = ss.str.replace(r"[\$€£]", "", regex=True)
         ss = ss.str.replace(r"(usd|cop|eur|mxn|clp)", "", regex=True, case=False)
-
-        # deja dígitos, -, . y ,
         ss = ss.str.replace(r"[^\d\-\.\,]", "", regex=True)
 
-        # si tiene punto y coma: coma = miles -> remover coma
         has_dot = ss.str.contains(r"\.", na=False)
         has_comma = ss.str.contains(r",", na=False)
         ss = ss.where(~(has_dot & has_comma), ss.str.replace(",", "", regex=False))
-
-        # si solo tiene coma: coma = decimal -> coma por punto
         ss = ss.where(~(has_comma & ~has_dot), ss.str.replace(",", ".", regex=False))
-
         return pd.to_numeric(ss, errors="coerce")
 
-    def to_datetime_loose(s: pd.Series) -> pd.Series:
-        if s is None:
-            return s
-        # dayfirst=True para formatos comunes en ES/LatAm
+    def to_datetime_venta(s: pd.Series) -> pd.Series:
+        """Fecha_Venta viene como dd/mm/yyyy."""
         return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
     # -------------------------
-    # Detectar columnas (CRÍTICO)
+    # Copia base
     # -------------------------
     tx = tx_raw.copy()
 
-    col_tx_id = find_col(tx, ["Transaccion_ID", "transaccion_id", "id_transaccion", "transaction_id", "id"])
-    col_sku = find_col(tx, ["SKU_ID", "sku_id", "sku", "producto_id", "product_id", "id_producto"])
-    col_ship = find_col(tx, ["Fecha_Envio", "fecha_envio", "fechaenvio", "ship_date", "fecha_despacho", "fecha despacho"])
-    col_deliv = find_col(tx, ["Fecha_Entrega", "fecha_entrega", "fechaentrega", "delivery_date", "fecha_entregado"])
-    col_city = find_col(tx, ["Ciudad_Destino", "ciudad_destino", "destino_ciudad", "ciudad", "city"])
-    col_status = find_col(tx, ["Estado_Envio", "estado_envio", "estado", "status", "estadoenvio"])
-    col_cost = find_col(tx, ["Costo_Envio_USD", "costo_envio_usd", "costo_envio", "shipping_cost", "costo", "costo_usd"])
-    col_lead = find_col(tx, ["Tiempo_Entrega_Dias", "tiempo_entrega_dias", "lead_time_dias", "lead_time", "tiempo_entrega"])
+    # -------------------------
+    # Columnas reales (tu header)
+    # -------------------------
+    col_tx_id = "Transaccion_ID" if "Transaccion_ID" in tx.columns else None
+    col_sku = "SKU_ID" if "SKU_ID" in tx.columns else None
+    col_fecha_venta = "Fecha_Venta" if "Fecha_Venta" in tx.columns else None
+    col_cantidad = "Cantidad_Vendida" if "Cantidad_Vendida" in tx.columns else None
+    col_precio = "Precio_Venta_Final" if "Precio_Venta_Final" in tx.columns else None
+    col_costo_envio = "Costo_Envio" if "Costo_Envio" in tx.columns else None
+    col_tiempo = "Tiempo_Entrega_Real" if "Tiempo_Entrega_Real" in tx.columns else None
+    col_estado = "Estado_Envio" if "Estado_Envio" in tx.columns else None
+    col_ciudad = "Ciudad_Destino" if "Ciudad_Destino" in tx.columns else None
+    col_canal = "Canal_Venta" if "Canal_Venta" in tx.columns else None
 
     # -------------------------
-    # Normalización automática de texto (diccionario + fuzzy)
+    # Normalización de texto (automática)
     # Reusa funciones de tu app:
-    # - normalize_text_keep_unknown
-    # - apply_manual_map
-    # - build_canonical_values
-    # - fuzzy_map_unique
+    # normalize_text_keep_unknown, apply_manual_map, build_canonical_values, fuzzy_map_unique
     # -------------------------
     CITY_MAP = {
         "bogota": "bogota", "bog": "bogota",
@@ -587,13 +561,11 @@ else:
         "entregado": "entregado",
         "entregada": "entregado",
         "delivered": "entregado",
-        "entregado completo": "entregado",
 
         "pendiente": "pendiente",
         "pending": "pendiente",
 
         "en transito": "en_transito",
-        "en transito ": "en_transito",
         "entransito": "en_transito",
         "transito": "en_transito",
         "in transit": "en_transito",
@@ -608,52 +580,75 @@ else:
         "unknown": "unknown",
     }
 
+    CANAL_MAP = {
+        "web": "web",
+        "pagina web": "web",
+        "online": "web",
+        "ecommerce": "web",
+
+        "tienda": "tienda",
+        "tienda fisica": "tienda",
+        "tienda física": "tienda",
+        "fisico": "tienda",
+        "físico": "tienda",
+
+        "whatsapp": "whatsapp",
+        "call center": "call_center",
+        "callcenter": "call_center",
+
+        "unknown": "unknown",
+    }
+
     tx_city_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
     tx_status_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
+    tx_canal_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
 
-    if col_city:
-        tx["Ciudad_Destino_original"] = tx[col_city].astype("string")
-        tx["Ciudad_Destino_clean"] = tx[col_city].apply(normalize_text_keep_unknown)
+    if col_ciudad:
+        tx["Ciudad_Destino_original"] = tx[col_ciudad].astype("string")
+        tx["Ciudad_Destino_clean"] = tx[col_ciudad].apply(normalize_text_keep_unknown)
         tx["Ciudad_Destino_clean"] = apply_manual_map(tx["Ciudad_Destino_clean"], CITY_MAP)
-        canonical_city = build_canonical_values(tx["Ciudad_Destino_clean"])
-        tx["Ciudad_Destino_clean"], tx_city_fuzzy = fuzzy_map_unique(
-            tx["Ciudad_Destino_clean"], canonical_city, threshold=0.92, delta=0.03
-        )
+        canonical = build_canonical_values(tx["Ciudad_Destino_clean"])
+        tx["Ciudad_Destino_clean"], tx_city_fuzzy = fuzzy_map_unique(tx["Ciudad_Destino_clean"], canonical, 0.92, 0.03)
 
-    if col_status:
-        tx["Estado_Envio_original"] = tx[col_status].astype("string")
-        tx["Estado_Envio_clean"] = tx[col_status].apply(normalize_text_keep_unknown)
+    if col_estado:
+        tx["Estado_Envio_original"] = tx[col_estado].astype("string")
+        tx["Estado_Envio_clean"] = tx[col_estado].apply(normalize_text_keep_unknown)
         tx["Estado_Envio_clean"] = apply_manual_map(tx["Estado_Envio_clean"], STATUS_MAP)
-        canonical_status = build_canonical_values(tx["Estado_Envio_clean"])
-        tx["Estado_Envio_clean"], tx_status_fuzzy = fuzzy_map_unique(
-            tx["Estado_Envio_clean"], canonical_status, threshold=0.92, delta=0.03
-        )
+        canonical = build_canonical_values(tx["Estado_Envio_clean"])
+        tx["Estado_Envio_clean"], tx_status_fuzzy = fuzzy_map_unique(tx["Estado_Envio_clean"], canonical, 0.92, 0.03)
+
+    if col_canal:
+        tx["Canal_Venta_original"] = tx[col_canal].astype("string")
+        tx["Canal_Venta_clean"] = tx[col_canal].apply(normalize_text_keep_unknown)
+        # ojo: como normalize_text_keep_unknown quita tildes, "tienda física" ya llega como "tienda fisica"
+        tx["Canal_Venta_clean"] = apply_manual_map(tx["Canal_Venta_clean"], {
+            # normaliza llaves posibles tras normalize
+            "tienda fisica": "tienda",
+            **{normalize_text_keep_unknown(k): v for k, v in CANAL_MAP.items()}
+        })
+        canonical = build_canonical_values(tx["Canal_Venta_clean"])
+        tx["Canal_Venta_clean"], tx_canal_fuzzy = fuzzy_map_unique(tx["Canal_Venta_clean"], canonical, 0.92, 0.03)
 
     # -------------------------
-    # Parseo robusto (fechas/números)
+    # Parseo de fecha y numéricos
     # -------------------------
-    if col_ship:
-        tx["Fecha_Envio_dt"] = to_datetime_loose(tx[col_ship])
+    if col_fecha_venta:
+        tx["Fecha_Venta_dt"] = to_datetime_venta(tx[col_fecha_venta])
     else:
-        tx["Fecha_Envio_dt"] = pd.NaT
+        tx["Fecha_Venta_dt"] = pd.NaT
 
-    if col_deliv:
-        tx["Fecha_Entrega_dt"] = to_datetime_loose(tx[col_deliv])
-    else:
-        tx["Fecha_Entrega_dt"] = pd.NaT
-
-    if col_cost:
-        tx["Costo_Envio_num"] = to_numeric_loose(tx[col_cost])
+    if col_costo_envio:
+        tx["Costo_Envio_num"] = to_numeric_loose(tx[col_costo_envio])
     else:
         tx["Costo_Envio_num"] = np.nan
 
-    if col_lead:
-        tx["Tiempo_Entrega_num"] = to_numeric_loose(tx[col_lead])
+    if col_tiempo:
+        tx["Tiempo_Entrega_num"] = pd.to_numeric(tx[col_tiempo], errors="coerce")
     else:
         tx["Tiempo_Entrega_num"] = np.nan
 
     # -------------------------
-    # Daños y flags (incluye flags de parseo inválido)
+    # Daños y flags
     # -------------------------
     tx_damage_cols, tx_flag_cols = [], []
 
@@ -667,100 +662,84 @@ else:
         tx[cname] = mask.astype(bool)
         tx_flag_cols.append(cname)
 
-    # ID / SKU
+    # daños básicos
     if col_tx_id:
         tx_add_damage("Transaccion_ID", tx[col_tx_id].isna())
     if col_sku:
         tx_add_damage("SKU_ID", tx[col_sku].isna())
 
-    # Fechas (daño si nulo) + invalidez (si había texto pero no parseó)
-    if col_ship:
-        tx_add_damage("Fecha_Envio", tx[col_ship].isna())
-        tx_add_flag("fecha_envio_invalida", tx["Fecha_Envio_dt"].isna() & tx[col_ship].notna())
+    # Fecha venta: nulo + invalido (texto pero NaT)
+    if col_fecha_venta:
+        tx_add_damage("Fecha_Venta", tx[col_fecha_venta].isna())
+        tx_add_flag("fecha_venta_invalida", tx["Fecha_Venta_dt"].isna() & tx[col_fecha_venta].notna())
     else:
-        tx_add_damage("Fecha_Envio", pd.Series(True, index=tx.index))
+        tx_add_damage("Fecha_Venta", pd.Series(True, index=tx.index))
 
-    if col_deliv:
-        tx_add_damage("Fecha_Entrega", tx[col_deliv].isna())
-        tx_add_flag("fecha_entrega_invalida", tx["Fecha_Entrega_dt"].isna() & tx[col_deliv].notna())
-    else:
-        tx_add_damage("Fecha_Entrega", pd.Series(True, index=tx.index))
-
-    # entrega < envio (solo si ambas válidas)
-    valid_both = tx["Fecha_Envio_dt"].notna() & tx["Fecha_Entrega_dt"].notna()
-    tx_add_flag("entrega_antes_envio", valid_both & (tx["Fecha_Entrega_dt"] < tx["Fecha_Envio_dt"]))
-
-    # fechas futuras (solo si válida)
+    # Venta futura (la regla de este dataset)
     today = pd.Timestamp.today().normalize()
-    tx_add_flag("envio_futuro", tx["Fecha_Envio_dt"].notna() & (tx["Fecha_Envio_dt"] > today))
-    tx_add_flag("entrega_futura", tx["Fecha_Entrega_dt"].notna() & (tx["Fecha_Entrega_dt"] > today))
+    tx_add_flag("venta_futura", tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today))
 
-    # costo (daño si nulo) + invalidez + <=0
-    if col_cost:
-        tx_add_damage("Costo_Envio", tx[col_cost].isna())
-        tx_add_flag("costo_invalido", tx["Costo_Envio_num"].isna() & tx[col_cost].notna())
+    # Costo: nulo + invalido + <=0
+    if col_costo_envio:
+        tx_add_damage("Costo_Envio", tx[col_costo_envio].isna())
+        tx_add_flag("costo_invalido", tx["Costo_Envio_num"].isna() & tx[col_costo_envio].notna())
         tx_add_flag("costo_no_positivo", tx["Costo_Envio_num"].notna() & (tx["Costo_Envio_num"] <= 0))
     else:
         tx_add_damage("Costo_Envio", pd.Series(True, index=tx.index))
 
-    # tiempo entrega (daño si nulo) + invalidez + negativo
-    if col_lead:
-        raw_lead = tx[col_lead]
-        tx_add_damage("Tiempo_Entrega", raw_lead.isna())
-        tx_add_flag("tiempo_invalido", tx["Tiempo_Entrega_num"].isna() & raw_lead.notna())
+    # Tiempo entrega: nulo + invalido + negativo
+    if col_tiempo:
+        tx_add_damage("Tiempo_Entrega_Real", tx[col_tiempo].isna())
+        tx_add_flag("tiempo_invalido", tx["Tiempo_Entrega_num"].isna() & tx[col_tiempo].notna())
         tx_add_flag("tiempo_negativo", tx["Tiempo_Entrega_num"].notna() & (tx["Tiempo_Entrega_num"] < 0))
     else:
-        tx_add_damage("Tiempo_Entrega", pd.Series(True, index=tx.index))
+        tx_add_damage("Tiempo_Entrega_Real", pd.Series(True, index=tx.index))
 
-    # Ciudad / Estado unknown
+    # Texto unknown
     if "Ciudad_Destino_clean" in tx.columns:
         tx_add_flag("ciudad_unknown", tx["Ciudad_Destino_clean"] == "unknown")
     if "Estado_Envio_clean" in tx.columns:
         tx_add_flag("estado_unknown", tx["Estado_Envio_clean"] == "unknown")
+    if "Canal_Venta_clean" in tx.columns:
+        tx_add_flag("canal_unknown", tx["Canal_Venta_clean"] == "unknown")
 
     # Conteos
     tx["damaged_cols_count"] = tx[tx_damage_cols].sum(axis=1) if tx_damage_cols else 0
     tx["any_flag"] = tx[tx_flag_cols].any(axis=1) if tx_flag_cols else False
 
-    # -------------------------
-    # Split RAW / CLEAN / ANOMALÍAS
-    # -------------------------
+    # Split
     tx_base_anom = tx["damaged_cols_count"] >= int(tx_damage_threshold)
     tx_anom_mask = (tx_base_anom | tx["any_flag"]) if tx_send_flags_to_anom else tx_base_anom
     tx_anom = tx[tx_anom_mask].copy()
     tx_clean = tx[~tx_anom_mask].copy()
 
     # -------------------------
-    # Diagnóstico SIEMPRE visible
+    # Diagnóstico
     # -------------------------
-    with st.expander("🧪 Diagnóstico (columnas detectadas y por qué pueden no salir flags)", expanded=True):
-        st.write("Si aquí ves `null` en alguna columna clave, ese era el motivo de que no se crearan flags.")
+    with st.expander("🧪 Diagnóstico (columnas detectadas)", expanded=True):
         st.json({
             "Transaccion_ID": col_tx_id,
             "SKU_ID": col_sku,
-            "Fecha_Envio": col_ship,
-            "Fecha_Entrega": col_deliv,
-            "Ciudad_Destino": col_city,
-            "Estado_Envio": col_status,
-            "Costo_Envio_USD": col_cost,
-            "Tiempo_Entrega_Dias": col_lead,
+            "Fecha_Venta": col_fecha_venta,
+            "Costo_Envio": col_costo_envio,
+            "Tiempo_Entrega_Real": col_tiempo,
+            "Ciudad_Destino": col_ciudad,
+            "Estado_Envio": col_estado,
+            "Canal_Venta": col_canal
         })
 
-        st.write("Tipos de datos (RAW):")
-        st.dataframe(tx_raw.dtypes.astype(str).to_frame("dtype"), use_container_width=True)
-
-        st.write("Flags generados:")
-        st.write(tx_flag_cols)
+        st.write("Ejemplos Fecha_Venta (raw → parsed):")
+        sample = tx[[col_fecha_venta, "Fecha_Venta_dt"]].head(10) if col_fecha_venta else pd.DataFrame()
+        if not sample.empty:
+            st.dataframe(sample, use_container_width=True)
 
     # -------------------------
-    # UI principal
+    # UI
     # -------------------------
     tx_tab1, tx_tab2, tx_tab3, tx_tab4 = st.tabs(["📋 Auditoría", "🚩 Flags (ejemplos)", "✅ CLEAN", "⚠️ ANOMALÍAS"])
 
     with tx_tab1:
         st.subheader("Auditoría de Transacciones")
-
-        # resumen
         st.dataframe(
             pd.DataFrame([{
                 "Filas RAW": len(tx),
@@ -771,41 +750,33 @@ else:
             use_container_width=True
         )
 
-        # conteo flags
         st.markdown("### Conteo de flags")
-        if tx_flag_cols:
-            st.dataframe(tx[tx_flag_cols].sum().sort_values(ascending=False).to_frame("conteo"),
-                         use_container_width=True)
-        else:
-            st.warning("No se generaron flags. Revisa el diagnóstico: probablemente faltan columnas o no se detectaron.")
+        st.dataframe(tx[tx_flag_cols].sum().sort_values(ascending=False).to_frame("conteo"), use_container_width=True)
 
-        # cambios de texto (si existen)
         st.markdown("### Cambios de texto (antes → después)")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             if "Ciudad_Destino_original" in tx.columns:
                 st.write("Ciudad")
-                st.dataframe(changes_report(tx["Ciudad_Destino_original"], tx["Ciudad_Destino_clean"]).head(40),
+                st.dataframe(changes_report(tx["Ciudad_Destino_original"], tx["Ciudad_Destino_clean"]).head(25),
                              use_container_width=True)
-            else:
-                st.caption("No se detectó columna de ciudad.")
         with c2:
             if "Estado_Envio_original" in tx.columns:
                 st.write("Estado")
-                st.dataframe(changes_report(tx["Estado_Envio_original"], tx["Estado_Envio_clean"]).head(40),
+                st.dataframe(changes_report(tx["Estado_Envio_original"], tx["Estado_Envio_clean"]).head(25),
                              use_container_width=True)
-            else:
-                st.caption("No se detectó columna de estado.")
+        with c3:
+            if "Canal_Venta_original" in tx.columns:
+                st.write("Canal")
+                st.dataframe(changes_report(tx["Canal_Venta_original"], tx["Canal_Venta_clean"]).head(25),
+                             use_container_width=True)
 
     with tx_tab2:
-        st.subheader("Ejemplos por flag (ver filas reales)")
-        if tx_flag_cols:
-            selected_flag = st.selectbox("Selecciona un flag:", tx_flag_cols, key="tx_flag_picker_v1")
-            flagged = tx[tx[selected_flag] == True].copy()
-            st.write(f"Filas con **{selected_flag}**: {len(flagged):,}")
-            st.dataframe(flagged.head(200), use_container_width=True)
-        else:
-            st.info("No hay flags disponibles (revisa el diagnóstico).")
+        st.subheader("Ejemplos por flag")
+        selected_flag = st.selectbox("Selecciona un flag:", tx_flag_cols, key="tx_flag_picker_v2")
+        flagged = tx[tx[selected_flag] == True].copy()
+        st.write(f"Filas con **{selected_flag}**: {len(flagged):,}")
+        st.dataframe(flagged.head(200), use_container_width=True)
 
     with tx_tab3:
         st.subheader("Transacciones CLEAN")
@@ -815,13 +786,13 @@ else:
         st.subheader("Transacciones ANOMALÍAS")
         st.dataframe(tx_anom.head(200), use_container_width=True)
 
-    # Fuzzy auditoría (si aplica)
     with st.expander("🔎 Fuzzy matching (auditoría)", expanded=False):
         if RAPIDFUZZ_AVAILABLE:
-            st.write("Ciudad – sugerencias (aplicadas/no aplicadas):")
-            st.dataframe(tx_city_fuzzy.head(60), use_container_width=True)
-            st.write("Estado – sugerencias (aplicadas/no aplicadas):")
-            st.dataframe(tx_status_fuzzy.head(60), use_container_width=True)
+            st.write("Ciudad – sugerencias:")
+            st.dataframe(tx_city_fuzzy.head(50), use_container_width=True)
+            st.write("Estado – sugerencias:")
+            st.dataframe(tx_status_fuzzy.head(50), use_container_width=True)
+            st.write("Canal – sugerencias:")
+            st.dataframe(tx_canal_fuzzy.head(50), use_container_width=True)
         else:
             st.caption("rapidfuzz no está instalado; fuzzy matching no se aplicó.")
-
