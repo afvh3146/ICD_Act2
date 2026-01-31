@@ -239,6 +239,7 @@ CATEGORY_MAP = {
     "smartphones": "smartphones",
     "smart phone": "smartphones",
     "smart phones": "smartphones",
+    "smart-phones": "smartphones",
     "smart phonees": "smartphones",  # typo común, ejemplo
 
     # tablets (por si aparece tablet)
