@@ -699,6 +699,7 @@ def process_feedback(df_raw: pd.DataFrame):
 
     if "Satisfaccion_NPS" in fb.columns:
         add_flag("nps_fuera_rango", fb["Satisfaccion_NPS"].notna() & ((fb["Satisfaccion_NPS"] < -100) | (fb["Satisfaccion_NPS"] > 100))
+                )
         add_flag("nps_categoria_fuera_rango", fb["NPS_categoria"].astype("string") == "fuera_rango")
 
     if "Comentario_Texto_clean" in fb.columns:
