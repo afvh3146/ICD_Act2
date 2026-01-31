@@ -670,11 +670,19 @@ else:
         tx_add_flag("costo_no_positivo", tx["Costo_Envio_num"].notna() & (tx["Costo_Envio_num"] <= 0))
 
     # Tiempo entrega: daño + parseo inválido + negativo
-    if col_lead:
-       _toggle = tx[col_lead]
-        tx_add_damage("Tiempo_Entrega_Dias", _toggle.isna())
-        tx_add_flag("tiempo_invalido", tx["Tiempo_Entrega_num"].isna() & _toggle.notna())
-        tx_add_flag("tiempo_negativo", tx["Tiempo_Entrega_num"].notna() & (tx["Tiempo_Entrega_num"] < 0))
+   
+if col_lead:
+    _toggle = tx[col_lead]
+    tx_add_damage("Tiempo_Entrega_Dias", _toggle.isna())
+    tx_add_flag(
+        "tiempo_invalido",
+        tx["Tiempo_Entrega_num"].isna() & _toggle.notna()
+    )
+    tx_add_flag(
+        "tiempo_negativo",
+        tx["Tiempo_Entrega_num"].notna() & (tx["Tiempo_Entrega_num"] < 0)
+    )
+
 
     # Ciudad/Estado unknown
     if "Ciudad_Destino_clean" in tx.columns:
