@@ -16,54 +16,67 @@ except Exception:
 
 st.set_page_config(page_title="Challenge 02 - DSS (Inventario)", layout="wide")
 st.title("Challenge 02 — DSS Auditable (Inventario)")
-st.caption("Sube el archivo de inventario. Luego aplicamos RAW / CLEAN / ANOMALÍAS + normalización de texto.")
-
+st.caption("Inventario: Normalización automática + RAW / CLEAN / ANOMALÍAS + reporte de cambios.")
 
 # =========================
-# Helpers: Normalización texto
+# Helpers: texto
 # =========================
-def normalize_text(x: str) -> str:
-    """trim, lower, quitar tildes, -/_ -> espacio, colapsar espacios, quitar símbolos raros."""
+UNKNOWN_TOKENS = {
+    "???", "??", "?", "na", "n a", "none", "null", "sin categoria", "sincategoria", "unknown", "sin categoria", "sin categoría"
+}
+
+def normalize_text_keep_unknown(x: str) -> str:
+    """
+    Normalización básica automática:
+    - trim
+    - lower
+    - detectar ??? antes de limpiar símbolos (para no volverlo NaN)
+    - quitar tildes
+    - -/_ -> espacio
+    - quitar símbolos raros
+    - colapsar espacios
+    """
     if pd.isna(x):
         return np.nan
-    x = str(x).strip()
+    raw = str(x).strip()
+    if raw == "":
+        return np.nan
+
+    raw_lower = raw.lower().strip()
+    # ✅ si es puro "?" o token tipo ???, retornamos unknown antes de limpiar símbolos
+    if raw_lower in UNKNOWN_TOKENS or (len(raw_lower) > 0 and set(raw_lower) <= {"?"}):
+        return "unknown"
+
+    # lower
+    x = raw_lower
+
+    # quitar tildes/acentos
+    x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("utf-8")
+
+    # separadores comunes -> espacio
+    x = re.sub(r"[-_/]+", " ", x)
+
+    # quitar caracteres raros (dejamos letras/numeros/espacios)
+    x = re.sub(r"[^a-z0-9\s]", "", x)
+
+    # colapsar espacios
+    x = re.sub(r"\s+", " ", x).strip()
+
+    if x in UNKNOWN_TOKENS or (len(x) > 0 and set(x) <= {"?"}):
+        return "unknown"
     if x == "":
         return np.nan
-    x = x.lower()
 
-    x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("utf-8")
-    x = re.sub(r"[-_/]+", " ", x)
-    x = re.sub(r"[^a-z0-9\s]", "", x)
-    x = re.sub(r"\s+", " ", x).strip()
     return x
 
 
-def normalize_unknowns(series_norm: pd.Series) -> pd.Series:
-    """Mapea tokens tipo ???, na, none, etc. a 'unknown'."""
-    unknown_tokens = {
-        "???", "??", "?", "na", "n a", "none", "null", "sin categoria", "sincategoria", "unknown"
-    }
-
-    def _fix(v):
-        if pd.isna(v):
-            return np.nan
-        vv = str(v).strip().lower()
-        if vv in unknown_tokens:
-            return "unknown"
-        # por si quedaran puros signos
-        if len(vv) > 0 and set(vv) <= {"?"}:
-            return "unknown"
-        return vv
-
-    return series_norm.map(_fix)
-
-
 def apply_manual_map(series_norm: pd.Series, manual_map: dict) -> pd.Series:
-    """Aplica diccionario manual sobre valores ya normalizados."""
+    """Mapeo manual SIEMPRE, sobre valores ya normalizados."""
     return series_norm.map(lambda v: manual_map.get(v, v))
 
 
 def build_canonical_values(series_after_manual: pd.Series) -> list:
+    """Valores canónicos para fuzzy matching (excluye unknown y nulos)."""
     vals = series_after_manual.dropna().astype(str)
     vals = vals[vals != "unknown"]
     return sorted(set(vals.tolist()))
@@ -73,8 +86,8 @@ def fuzzy_map_unique(series_vals: pd.Series, canonical: list, threshold: float =
     """
     Fuzzy matching solo si:
     - score >= threshold
-    - match “único”: best_score - second_score >= delta  (o second_score < threshold)
-    Devuelve: serie mapeada + tabla de sugerencias
+    - match único: best_score - second_score >= delta OR second_score < threshold
+    Retorna serie mapeada + df sugerencias (aplicadas y no aplicadas).
     """
     cols = ["from", "to", "score", "applied"]
 
@@ -109,35 +122,25 @@ def fuzzy_map_unique(series_vals: pd.Series, canonical: list, threshold: float =
         else:
             changes.append({"from": v, "to": best_match, "score": best_score, "applied": False})
 
-    # ✅ FIX: si changes está vacío, devolvemos DF vacío con columnas
     if not changes:
         return mapped, pd.DataFrame(columns=cols)
 
-    changes_df = pd.DataFrame(changes)
-    # sort seguro (ya existen columnas)
-    changes_df = changes_df.sort_values(["applied", "score"], ascending=[False, False])
+    changes_df = pd.DataFrame(changes).sort_values(["applied", "score"], ascending=[False, False])
     return mapped, changes_df
 
 
 def changes_report(original: pd.Series, final: pd.Series) -> pd.DataFrame:
-    df = pd.DataFrame({
-        "antes": original.astype("string"),
-        "despues": final.astype("string"),
-    }).dropna(subset=["antes", "despues"])
-
+    df = pd.DataFrame({"antes": original.astype("string"), "despues": final.astype("string")})
+    df = df.dropna(subset=["antes", "despues"])
     if df.empty:
         return pd.DataFrame(columns=["antes", "despues", "conteo"])
 
-    rep = (
-        df.value_counts()
-        .reset_index(name="conteo")
-        .sort_values("conteo", ascending=False)
-    )
+    rep = df.value_counts().reset_index(name="conteo").sort_values("conteo", ascending=False)
     return rep
 
 
 # =========================
-# Helpers numéricos/outliers
+# Helpers: numéricos/outliers
 # =========================
 def to_numeric(s):
     return pd.to_numeric(s, errors="coerce")
@@ -176,7 +179,6 @@ if uploaded_inv is None:
     st.info("👈 Sube el archivo de inventario para iniciar. (No se carga nada por defecto).")
     st.stop()
 
-
 @st.cache_data(show_spinner=False)
 def load_from_upload(uploaded_file) -> pd.DataFrame:
     return pd.read_csv(uploaded_file)
@@ -186,30 +188,22 @@ st.success("Inventario cargado ✅")
 
 
 # =========================
-# Sidebar: Limpieza Inventario (sección)
+# Sidebar: Limpieza Inventario
 # =========================
 st.sidebar.header("🧹 Limpieza Inventario")
 
-with st.sidebar.expander("Normalización de texto (Categoria / Bodega_Origen)", expanded=True):
-    st.write("**Siempre aplicada:** trim, lower, quitar tildes, -/_→espacio, colapsar espacios.")
-    enable_manual_map = st.checkbox("Aplicar mapeo manual (recomendado)", value=True)
+with st.sidebar.expander("Normalización de texto (AUTOMÁTICA)", expanded=True):
+    st.write("**Siempre aplicado:** trim, lower, quitar tildes, -/_→espacio, colapsar espacios, símbolos fuera.")
+    st.write("**Siempre aplicado:** mapeo manual (diccionario).")
     enable_fuzzy = st.checkbox("Fuzzy matching (modo avanzado, match único)", value=True)
-
     fuzzy_threshold = st.slider("Umbral fuzzy", 0.85, 0.99, 0.92, 0.01)
     fuzzy_delta = st.slider("Diferencia mínima vs 2do mejor", 0.01, 0.10, 0.03, 0.01)
-
     if enable_fuzzy and not RAPIDFUZZ_AVAILABLE:
         st.warning("⚠️ rapidfuzz no está instalado. Fuzzy se desactivará automáticamente.")
 
 with st.sidebar.expander("Reglas de ANOMALÍAS / Daños", expanded=True):
-    damage_threshold = st.number_input(
-        "Enviar fila a ANOMALÍAS si columnas dañadas ≥",
-        min_value=1, max_value=10, value=2
-    )
-    send_flags_to_anom = st.checkbox(
-        "Enviar a ANOMALÍAS si tiene cualquier flag de riesgo",
-        value=True
-    )
+    damage_threshold = st.number_input("Enviar fila a ANOMALÍAS si columnas dañadas ≥", 1, 10, 2)
+    send_flags_to_anom = st.checkbox("Enviar a ANOMALÍAS si tiene cualquier flag de riesgo", value=True)
 
 with st.sidebar.expander("Outliers (Costo / Lead Time)", expanded=False):
     outlier_method = st.selectbox("Método", ["IQR", "Percentiles"], index=0)
@@ -222,73 +216,92 @@ with st.sidebar.expander("Outliers (Costo / Lead Time)", expanded=False):
         iqr_k = None
 
 with st.sidebar.expander("Imputación (solo CLEAN)", expanded=False):
-    impute_lead = st.selectbox(
-        "Lead_Time_Dias nulo →",
-        ["No imputar", "Mediana global", "Mediana por categoría"],
-        index=2
-    )
-    impute_reorder = st.selectbox(
-        "Punto_Reorden nulo →",
-        ["No imputar", "Mediana global", "Mediana por categoría"],
-        index=2
-    )
+    impute_lead = st.selectbox("Lead_Time_Dias nulo →", ["No imputar", "Mediana global", "Mediana por categoría"], index=2)
+    impute_reorder = st.selectbox("Punto_Reorden nulo →", ["No imputar", "Mediana global", "Mediana por categoría"], index=2)
 
 
 # =========================
-# Tipificación + Normalización
+# 1) Normalización SIEMPRE ANTES de flags/outliers/split
 # =========================
 inv = inv_raw.copy()
 
-# Diccionarios manuales (puedes expandirlos con lo que veas en el reporte)
+# ✅ Diccionarios manuales más completos para tu caso (y fáciles de ampliar)
+# OJO: las llaves deben estar en formato normalizado (lower, sin tildes, sin guiones)
 CATEGORY_MAP = {
-    "smart phone": "smartphones",
-    "smartphones": "smartphones",
+    # laptops
+    "laptop": "laptops",
+    "laptops": "laptops",
+    "notebook": "laptops",
+    "notebooks": "laptops",
+
+    # smartphones
     "smartphone": "smartphones",
+    "smartphones": "smartphones",
+    "smart phone": "smartphones",
     "smart phones": "smartphones",
+    "smart phonees": "smartphones",  # typo común, ejemplo
+
+    # tablets (por si aparece tablet)
+    "tablet": "tablets",
+    "tablets": "tablets",
+
+    # accesorios/monitores (ejemplos; ajusta si hay más)
+    "accesorio": "accesorios",
+    "accesorios": "accesorios",
+    "monitor": "monitores",
+    "monitores": "monitores",
+
+    # unknown
+    "unknown": "unknown",
 }
 
 BODEGA_MAP = {
     "med": "medellin",
-    "medellin": "medellin",
     "mde": "medellin",
+    "medellin": "medellin",
     "bog": "bogota",
     "bogota": "bogota",
+    "cali": "cali",
+    "barranquilla": "barranquilla",
+    "unknown": "unknown",
 }
 
 cat_fuzzy_suggestions = pd.DataFrame(columns=["from", "to", "score", "applied"])
 bod_fuzzy_suggestions = pd.DataFrame(columns=["from", "to", "score", "applied"])
 
-# --- Categoria ---
+# ---- Categoria ----
 if "Categoria" in inv.columns:
     inv["Categoria_original"] = inv["Categoria"].astype("string")
-    inv["Categoria_norm"] = inv["Categoria"].apply(normalize_text)
-    inv["Categoria_norm"] = normalize_unknowns(inv["Categoria_norm"])
+    inv["Categoria_norm"] = inv["Categoria"].apply(normalize_text_keep_unknown)
+    inv["Categoria_norm"] = apply_manual_map(inv["Categoria_norm"], CATEGORY_MAP)
 
-    if enable_manual_map:
-        inv["Categoria_norm"] = apply_manual_map(inv["Categoria_norm"], CATEGORY_MAP)
+    # ✅ Esto será lo “oficial” para análisis
+    inv["Categoria_clean"] = inv["Categoria_norm"]
 
+    # Fuzzy opcional (después del mapeo manual)
     if enable_fuzzy and RAPIDFUZZ_AVAILABLE:
-        canonical_cat = build_canonical_values(inv["Categoria_norm"])
-        inv["Categoria_norm"], cat_fuzzy_suggestions = fuzzy_map_unique(
-            inv["Categoria_norm"], canonical_cat, threshold=fuzzy_threshold, delta=fuzzy_delta
+        canonical_cat = build_canonical_values(inv["Categoria_clean"])
+        inv["Categoria_clean"], cat_fuzzy_suggestions = fuzzy_map_unique(
+            inv["Categoria_clean"], canonical_cat, threshold=fuzzy_threshold, delta=fuzzy_delta
         )
 
-# --- Bodega_Origen ---
+# ---- Bodega_Origen ----
 if "Bodega_Origen" in inv.columns:
     inv["Bodega_Origen_original"] = inv["Bodega_Origen"].astype("string")
-    inv["Bodega_Origen_norm"] = inv["Bodega_Origen"].apply(normalize_text)
-    inv["Bodega_Origen_norm"] = normalize_unknowns(inv["Bodega_Origen_norm"])
+    inv["Bodega_Origen_norm"] = inv["Bodega_Origen"].apply(normalize_text_keep_unknown)
+    inv["Bodega_Origen_norm"] = apply_manual_map(inv["Bodega_Origen_norm"], BODEGA_MAP)
 
-    if enable_manual_map:
-        inv["Bodega_Origen_norm"] = apply_manual_map(inv["Bodega_Origen_norm"], BODEGA_MAP)
+    inv["Bodega_Origen_clean"] = inv["Bodega_Origen_norm"]
 
     if enable_fuzzy and RAPIDFUZZ_AVAILABLE:
-        canonical_bod = build_canonical_values(inv["Bodega_Origen_norm"])
-        inv["Bodega_Origen_norm"], bod_fuzzy_suggestions = fuzzy_map_unique(
-            inv["Bodega_Origen_norm"], canonical_bod, threshold=fuzzy_threshold, delta=fuzzy_delta
+        canonical_bod = build_canonical_values(inv["Bodega_Origen_clean"])
+        inv["Bodega_Origen_clean"], bod_fuzzy_suggestions = fuzzy_map_unique(
+            inv["Bodega_Origen_clean"], canonical_bod, threshold=fuzzy_threshold, delta=fuzzy_delta
         )
 
-# Tipificación numérica/fechas
+# =========================
+# 2) Tipificación numérica/fechas (todavía antes del split)
+# =========================
 if "Stock_Actual" in inv.columns:
     inv["Stock_Actual"] = to_numeric(inv["Stock_Actual"])
 if "Costo_Unitario_USD" in inv.columns:
@@ -302,7 +315,7 @@ if "Ultima_Revision" in inv.columns:
 
 
 # =========================
-# damages + flags
+# 3) damages + flags (ya con Categoria_clean/Bodega_Origen_clean)
 # =========================
 damage_cols, flag_cols = [], []
 
@@ -346,9 +359,15 @@ if "Ultima_Revision" in inv.columns:
     today = pd.Timestamp.today().normalize()
     add_flag("fecha_revision_futura", inv["Ultima_Revision"] > today)
 
-# Categoria unknown
-if "Categoria_norm" in inv.columns:
-    add_flag("categoria_unknown", inv["Categoria_norm"] == "unknown")
+# Categoria unknown (ya sobre Categoria_clean)
+if "Categoria_clean" in inv.columns:
+    add_flag("categoria_unknown", inv["Categoria_clean"] == "unknown")
+    add_damage("Categoria_clean", inv["Categoria_clean"].isna())
+
+# Bodega unknown
+if "Bodega_Origen_clean" in inv.columns:
+    add_flag("bodega_unknown", inv["Bodega_Origen_clean"] == "unknown")
+    add_damage("Bodega_Origen_clean", inv["Bodega_Origen_clean"].isna())
 
 # Outliers como flags
 def compute_outlier_flag(col, flagname):
@@ -366,17 +385,16 @@ def compute_outlier_flag(col, flagname):
 
     add_flag(flagname, (inv[col] < low) | (inv[col] > high))
 
-# outliers (si el usuario abrió sección y dejó config, igual aplica)
 compute_outlier_flag("Costo_Unitario_USD", "costo_outlier")
 compute_outlier_flag("Lead_Time_Dias", "leadtime_outlier")
 
-# damage count y flags
+# Conteos
 inv["damaged_cols_count"] = inv[damage_cols].sum(axis=1) if damage_cols else 0
 inv["any_flag"] = inv[flag_cols].any(axis=1) if flag_cols else False
 
 
 # =========================
-# Split RAW / CLEAN / ANOMALÍAS
+# 4) Split RAW / CLEAN / ANOMALÍAS (después de limpiar texto)
 # =========================
 base_anom_mask = inv["damaged_cols_count"] >= int(damage_threshold)
 anom_mask = (base_anom_mask | inv["any_flag"]) if send_flags_to_anom else base_anom_mask
@@ -386,7 +404,7 @@ inv_clean = inv[~anom_mask].copy()
 
 
 # =========================
-# Imputación SOLO en CLEAN
+# 5) Imputación SOLO en CLEAN (usa Categoria_clean)
 # =========================
 def group_median_impute(df, target_col, group_col):
     if target_col not in df.columns or group_col not in df.columns:
@@ -406,7 +424,7 @@ def global_median_impute(df, target_col):
     df[f"imputed__{target_col}"] = was_null.astype(bool)
     return df
 
-group_cat_col = "Categoria_norm" if "Categoria_norm" in inv_clean.columns else ("Categoria" if "Categoria" in inv_clean.columns else None)
+group_cat_col = "Categoria_clean" if "Categoria_clean" in inv_clean.columns else ("Categoria" if "Categoria" in inv_clean.columns else None)
 
 if "Lead_Time_Dias" in inv_clean.columns:
     if impute_lead == "Mediana global":
@@ -430,6 +448,10 @@ with tab1:
     st.subheader("Auditoría de Inventario")
     st.dataframe(audit_summary(inv, inv_clean, inv_anom, damage_cols, flag_cols), use_container_width=True)
 
+    st.markdown("### Verificación rápida: valores únicos (Categoría limpia)")
+    if "Categoria_clean" in inv.columns:
+        st.write(inv["Categoria_clean"].value_counts(dropna=False).head(20))
+
     st.markdown("### Top columnas con más nulos (RAW)")
     st.dataframe(
         inv.isna().mean().sort_values(ascending=False).head(15).to_frame("% nulos").mul(100),
@@ -438,8 +460,7 @@ with tab1:
 
     st.markdown("### Conteo de flags (riesgos)")
     if flag_cols:
-        flag_counts = inv[flag_cols].sum().sort_values(ascending=False).to_frame("conteo")
-        st.dataframe(flag_counts, use_container_width=True)
+        st.dataframe(inv[flag_cols].sum().sort_values(ascending=False).to_frame("conteo"), use_container_width=True)
 
     st.markdown("### Ejemplos de registros marcados (primeros 50)")
     cols_show = [c for c in inv.columns if not c.startswith("damage__")]
@@ -453,13 +474,13 @@ with tab2:
 
     with c1:
         st.markdown("### Categoria")
-        if "Categoria_original" in inv.columns and "Categoria_norm" in inv.columns:
-            rep = changes_report(inv["Categoria_original"], inv["Categoria_norm"])
-            st.dataframe(rep.head(50), use_container_width=True)
+        if "Categoria_original" in inv.columns and "Categoria_clean" in inv.columns:
+            rep = changes_report(inv["Categoria_original"], inv["Categoria_clean"])
+            st.dataframe(rep.head(60), use_container_width=True)
 
             st.markdown("**Sugerencias fuzzy (aplicadas / no aplicadas)**")
             if enable_fuzzy and RAPIDFUZZ_AVAILABLE:
-                st.dataframe(cat_fuzzy_suggestions.head(50), use_container_width=True)
+                st.dataframe(cat_fuzzy_suggestions.head(60), use_container_width=True)
             else:
                 st.caption("Fuzzy desactivado o rapidfuzz no disponible.")
         else:
@@ -467,13 +488,13 @@ with tab2:
 
     with c2:
         st.markdown("### Bodega_Origen")
-        if "Bodega_Origen_original" in inv.columns and "Bodega_Origen_norm" in inv.columns:
-            repb = changes_report(inv["Bodega_Origen_original"], inv["Bodega_Origen_norm"])
-            st.dataframe(repb.head(50), use_container_width=True)
+        if "Bodega_Origen_original" in inv.columns and "Bodega_Origen_clean" in inv.columns:
+            repb = changes_report(inv["Bodega_Origen_original"], inv["Bodega_Origen_clean"])
+            st.dataframe(repb.head(60), use_container_width=True)
 
             st.markdown("**Sugerencias fuzzy (aplicadas / no aplicadas)**")
             if enable_fuzzy and RAPIDFUZZ_AVAILABLE:
-                st.dataframe(bod_fuzzy_suggestions.head(50), use_container_width=True)
+                st.dataframe(bod_fuzzy_suggestions.head(60), use_container_width=True)
             else:
                 st.caption("Fuzzy desactivado o rapidfuzz no disponible.")
         else:
@@ -483,10 +504,23 @@ with tab2:
 with tab3:
     st.subheader("Inventario CLEAN (para KPIs)")
     st.caption("Datos seguros para análisis. Imputaciones marcadas con columnas imputed__*.")
-    st.dataframe(inv_clean.head(200), use_container_width=True)
+    # mostramos columnas relevantes primero (incluye Categoria_clean)
+    preferred = [c for c in ["SKU_ID", "Categoria_clean", "Stock_Actual", "Costo_Unitario_USD",
+                            "Punto_Reorden", "Lead_Time_Dias", "Bodega_Origen_clean", "Ultima_Revision"]
+                 if c in inv_clean.columns]
+    st.dataframe(inv_clean[preferred + [c for c in inv_clean.columns if c not in preferred]].head(200),
+                 use_container_width=True)
 
 
 with tab4:
     st.subheader("Inventario ANOMALÍAS (riesgo / outliers / daños)")
     st.caption("Registros excluidos de KPIs, útiles para diagnóstico y storytelling.")
-    st.dataframe(inv_anom.head(200), use_container_width=True)
+    preferred = [c for c in ["SKU_ID", "Categoria_clean", "Stock_Actual", "Costo_Unitario_USD",
+                            "Punto_Reorden", "Lead_Time_Dias", "Bodega_Origen_clean", "Ultima_Revision"]
+                 if c in inv_anom.columns]
+    st.dataframe(inv_anom[preferred + [c for c in inv_anom.columns if c not in preferred]].head(200),
+                 use_container_width=True)
+
+# Aviso fuzzy
+if enable_fuzzy and not RAPIDFUZZ_AVAILABLE:
+    st.warning("Para fuzzy matching instala rapidfuzz: `pip install rapidfuzz` (y agrégalo a requirements.txt).")
