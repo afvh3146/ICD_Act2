@@ -1378,42 +1378,44 @@ def main() -> None:
                 st.write(f"Filas con flags: {len(fb_rare):,}")
                 st.dataframe(fb_rare.head(200), use_container_width=True)
 
-    with tabs[1]:
+        with tabs[1]:
         st.subheader("📊 Operaciones")
-        if "margen_negativo" in analysis_results:
-            st.markdown("### 1️⃣ Margen negativo por SKU")
-            q1_df = analysis_results["margen_negativo"]
-            st.write(f"SKUs con margen total negativo: {len(q1_df):,}")
-            st.dataframe(q1_df.head(50), use_container_width=True)
 
-        if "sku_fantasma" in analysis_results:
-            st.markdown("### 3️⃣ Venta invisible (SKU fantasma)")
-            info = analysis_results["sku_fantasma"]
-            st.write(
-                f"Transacciones con SKU fantasma: {info['num_transacciones']:,}\n"
-                f"Ingresos perdidos: USD {info['total_perdido']:,.2f}\n"
-                f"% del ingreso total en riesgo: {info['porcentaje']*100:.2f}%"
-            )
-
-                st.markdown("### 1️⃣ Margen negativo — insights accionables")
+        st.markdown("### 1️⃣ Margen negativo — insights accionables")
 
         # P1: margen por categoría
         if "margen_por_categoria" in analysis_results:
             df_cat = analysis_results["margen_por_categoria"].copy()
-            # opcional: mostrar solo categorías con margen negativo al final
-            show_only_neg = st.checkbox("Mostrar solo categorías con margen total negativo", value=False, key="p1_only_neg_cat")
+            show_only_neg = st.checkbox(
+                "Mostrar solo categorías con margen total negativo",
+                value=False,
+                key="p1_only_neg_cat"
+            )
             if show_only_neg:
                 df_cat = df_cat[df_cat["Margen_Total"] < 0]
-            chart_bar(df_cat, "Categoria_clean", "Margen_Total", "Margen total por categoría")
+
+            chart_bar(
+                df_cat,
+                "Categoria_clean",
+                "Margen_Total",
+                "Margen total por categoría"
+            )
 
         # P1: scatter por SKU (priorización)
         if "sku_scatter_margen_vs_cantidad" in analysis_results:
             by_sku = analysis_results["sku_scatter_margen_vs_cantidad"].copy()
-            show_only_neg_sku = st.checkbox("Mostrar solo SKUs con margen total negativo", value=True, key="p1_only_neg_sku")
+            show_only_neg_sku = st.checkbox(
+                "Mostrar solo SKUs con margen total negativo",
+                value=True,
+                key="p1_only_neg_sku"
+            )
             if show_only_neg_sku:
                 by_sku = by_sku[by_sku["Margen_Total"] < 0]
 
-            topn = st.slider("Top N SKUs por impacto (|margen|)", 50, 500, 200, step=50, key="p1_topn_sku")
+            topn = st.slider(
+                "Top N SKUs por impacto (|margen|)",
+                50, 500, 200, step=50, key="p1_topn_sku"
+            )
             by_sku["abs_margen"] = by_sku["Margen_Total"].abs()
             by_sku = by_sku.sort_values("abs_margen", ascending=False).head(topn)
 
@@ -1425,19 +1427,32 @@ def main() -> None:
                 size="Ingreso_Total" if "Ingreso_Total" in by_sku.columns else None,
                 title="Prioriza SKUs: Cantidad total vs Margen total (tamaño = ingreso)",
             )
-            st.caption("Interpretación: abajo (margen negativo) y a la derecha (alto volumen) = prioridad máxima.")
 
         st.markdown("---")
-        st.markdown("### 3️⃣ Venta invisible (SKU fantasma) — exploración")
+        st.markdown("### 3️⃣ Venta invisible (SKU fantasma)")
 
         if "sku_fantasma_por_categoria" in analysis_results:
             ghost_cat = analysis_results["sku_fantasma_por_categoria"].copy()
-            topc = st.slider("Top categorías por ingreso perdido", 5, 30, 10, key="p3_top_cat")
-            chart_bar(ghost_cat.head(topc), "Categoria_clean", "Ingreso_Perdido", "Ingresos perdidos por SKU fantasma (Top categorías)")
+            topc = st.slider(
+                "Top categorías por ingreso perdido",
+                5, 30, 10, key="p3_top_cat"
+            )
+            chart_bar(
+                ghost_cat.head(topc),
+                "Categoria_clean",
+                "Ingreso_Perdido",
+                "Ingresos perdidos por SKU fantasma (Top categorías)"
+            )
 
         if "donut_ingreso_riesgo_fantasma" in analysis_results:
             donut_df = analysis_results["donut_ingreso_riesgo_fantasma"].copy()
-            chart_donut(donut_df, "Tipo", "Valor", "Proporción del ingreso en riesgo por SKU fantasma")
+            chart_donut(
+                donut_df,
+                "Tipo",
+                "Valor",
+                "Proporción del ingreso en riesgo por SKU fantasma"
+            )
+
 
 
     with tabs[2]:
