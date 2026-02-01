@@ -487,13 +487,22 @@ def process_transacciones(df_raw: pd.DataFrame):
     # Flags
     flag_cols = []
     def add_flag(name, mask):
-        cname = f"flag__{name}"
-        if cname in tx.columns:
-            if cname not in flag_cols:
-                flag_cols.append(cname)
-            return
-        tx[cname] = mask.astype(bool)
-        flag_cols.append(cname)
+    cname = f"flag__{name}"
+    if cname in tx.columns:
+        if cname not in flag_cols:
+            flag_cols.append(cname)
+        return
+
+    # 🔒 robusto: convertir NA -> False antes de castear
+    if isinstance(mask, pd.Series):
+        mask = mask.fillna(False)
+    else:
+        # si por alguna razón llega escalar
+        mask = pd.Series(bool(mask), index=tx.index)
+
+    tx[cname] = mask.astype(bool)
+    flag_cols.append(cname)
+
 
     if "Transaccion_ID" in tx.columns:
         add_flag("transaccion_id_nulo", tx["Transaccion_ID"].isna())
