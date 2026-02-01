@@ -7,7 +7,7 @@ Qué cubre esta versión (corregida y completa):
 2) Health score (raw vs final) + descarga de reporte JSON.
 3) JOIN reproducible (Tx↔Inv↔Fb) + flags de SKU fantasma y sin feedback.
 4) Feature engineering (Ingreso, Costos, Margen, Días desde revisión).
-5) Visualizaciones “de nota alta” alineadas a P1..P5:
+5) Visualizaciones alineadas a P1..P5:
    - P1: Margen negativo → bar por categoría + scatter priorización por SKU
    - P2: Logística vs NPS → scatter (por ciudad/bodega, tamaño = N)
    - P3: SKU fantasma → bar por categoría + donut proporción ingreso en riesgo
@@ -1064,42 +1064,200 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
     except Exception as e:
         return f"Error al llamar a Groq: {e}"
 
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
 
-def build_ai_prompt(df: pd.DataFrame) -> List[Dict[str, str]]:
-    """Construct a summarised prompt for Groq based on filtered data (no raw rows)."""
+
+def _df_top_to_text(df: pd.DataFrame, cols: List[str], n: int = 5) -> str:
+    """Convierte un top N a texto tipo bullet para meterlo al prompt."""
+    if df is None or df.empty:
+        return "No hay datos suficientes."
+    use = [c for c in cols if c in df.columns]
+    if not use:
+        return "No hay columnas suficientes."
+    df2 = df[use].head(n).copy()
+    lines = []
+    for _, r in df2.iterrows():
+        parts = []
+        for c in use:
+            v = r.get(c, "")
+            if isinstance(v, (int, np.integer)):
+                parts.append(f"{c}={int(v)}")
+            elif isinstance(v, (float, np.floating)):
+                parts.append(f"{c}={v:.2f}")
+            else:
+                parts.append(f"{c}={v}")
+        lines.append("- " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+def build_ai_prompt_from_analysis(
+    df_filtered: pd.DataFrame,
+    analysis_results: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """
+    Construye un prompt para Groq usando SOLO estadísticas agregadas ya calculadas.
+    df_filtered: el dataframe ya filtrado/limpio (joined) para totales globales básicos.
+    analysis_results: salida de compute_analysis(df_filtered)
+    """
     messages: List[Dict[str, str]] = []
+
     messages.append({
         "role": "system",
         "content": (
-            "Eres un analista de datos senior que brinda recomendaciones de negocio "
-            "basadas en estadísticas resumidas de ventas, inventario y feedback. "
-            "Responde con 3–5 bullets accionables y priorizados."
-        ),
+            "Eres un consultor senior de analítica para retail y logística. "
+            "Tu audiencia es la Junta Directiva. "
+            "NO expliques código, NO menciones pandas/streamlit, NO digas 'según el dataset'. "
+            "Solo habla de impacto financiero, riesgo operativo y decisiones. "
+            "Responde en EXACTAMENTE 3 párrafos. "
+            "En cada párrafo incluye recomendaciones TÁCTICAS numeradas y priorizadas por complejidad "
+            "(Baja, Media, Alta). "
+            "Cada recomendación debe referenciar explícitamente la evidencia (USD, %, tops, rankings) incluida en el resumen."
+        )
     })
 
-    total_tx = int(len(df))
-    margen_total = float(df.get("Margen_Bruto", pd.Series(dtype=float)).sum())
-    margen_neg_count = int((df.get("Margen_Bruto", pd.Series(dtype=float)) < 0).sum())
-    sku_fantasma_count = int(df.get("flag__sku_no_existe_en_inventario", pd.Series(dtype=bool)).sum())
-    sin_feedback_count = int(df.get("flag__sin_feedback", pd.Series(dtype=bool)).sum())
-    avg_nps = float(df.get("Satisfaccion_NPS", pd.Series(dtype=float)).mean()) if "Satisfaccion_NPS" in df.columns else 0.0
-    avg_entrega = float(df.get("Tiempo_Entrega_Real", pd.Series(dtype=float)).mean()) if "Tiempo_Entrega_Real" in df.columns else 0.0
+    d = df_filtered.copy() if df_filtered is not None else pd.DataFrame()
 
-    messages.append({
-        "role": "user",
-        "content": (
-            f"Resumen:\n"
-            f"- Total transacciones: {total_tx}\n"
-            f"- Margen total (USD): {margen_total:.2f}\n"
-            f"- # transacciones con margen negativo: {margen_neg_count}\n"
-            f"- # SKUs fantasma: {sku_fantasma_count}\n"
-            f"- # transacciones sin feedback: {sin_feedback_count}\n"
-            f"- NPS promedio: {avg_nps:.2f}\n"
-            f"- Tiempo entrega promedio: {avg_entrega:.2f}\n\n"
-            "Entrega recomendaciones para reducir margen negativo, mejorar NPS y disminuir riesgos operativos."
-        ),
-    })
+    # Totales generales
+    total_tx = int(len(d)) if not d.empty else 0
+    total_ing = _safe_float(d["Ingreso"].sum(), 0.0) if (not d.empty and "Ingreso" in d.columns) else 0.0
+    total_margen = _safe_float(d["Margen_Bruto"].sum(), 0.0) if (not d.empty and "Margen_Bruto" in d.columns) else 0.0
+
+    # -------------------------
+    # P1 - Margen negativo
+    # -------------------------
+    p1_top_skus_txt = "No hay datos suficientes."
+    p1_by_cat_txt = "No hay datos suficientes."
+    p1_counts = ""
+
+    if "margen_negativo" in analysis_results and isinstance(analysis_results["margen_negativo"], pd.DataFrame):
+        mneg = analysis_results["margen_negativo"].copy()
+        p1_counts = f"SKUs con margen total negativo: {len(mneg):,}"
+        # top pérdidas (más negativo)
+        mneg = mneg.sort_values("Margen_Total").head(10)
+        p1_top_skus_txt = _df_top_to_text(mneg, ["SKU_ID", "Margen_Total", "Cantidad_Total", "Ingreso_Total"], n=10)
+
+    if "margen_por_categoria" in analysis_results and isinstance(analysis_results["margen_por_categoria"], pd.DataFrame):
+        mc = analysis_results["margen_por_categoria"].copy().sort_values("Margen_Total").head(10)
+        p1_by_cat_txt = _df_top_to_text(mc, ["Categoria_clean", "Margen_Total"], n=10)
+
+    # Señal “online” si existe la columna
+    online_hint = ""
+    if not d.empty and "Canal_Venta_clean" in d.columns and "Margen_Bruto" in d.columns:
+        online = d[d["Canal_Venta_clean"].astype("string") == "web"].copy()
+        if len(online) > 0:
+            online_margen = _safe_float(online["Margen_Bruto"].sum(), 0.0)
+            online_ing = _safe_float(online["Ingreso"].sum(), 0.0) if "Ingreso" in online.columns else 0.0
+            online_hint = (
+                f"Canal web: transacciones={len(online):,}, ingreso={online_ing:.2f} USD, margen_total={online_margen:.2f} USD."
+            )
+
+    # -------------------------
+    # P2 - Logística vs NPS
+    # -------------------------
+    p2_txt = "No hay datos suficientes."
+    if "logistica_vs_nps" in analysis_results and isinstance(analysis_results["logistica_vs_nps"], pd.DataFrame):
+        l = analysis_results["logistica_vs_nps"].copy()
+        # “peor zona”: NPS más bajo con tiempos altos y soporte (N)
+        if "N" in l.columns:
+            l2 = l[l["N"] >= 5].copy()  # soporte mínimo
+        else:
+            l2 = l.copy()
+
+        # score simple: tiempo alto + nps bajo
+        if "Tiempo_Entrega_Prom" in l2.columns and "NPS_Prom" in l2.columns:
+            l2["score_riesgo"] = (l2["Tiempo_Entrega_Prom"].rank(pct=True)) + ((-l2["NPS_Prom"]).rank(pct=True))
+            l2 = l2.sort_values("score_riesgo", ascending=False).head(8)
+            p2_txt = _df_top_to_text(
+                l2,
+                ["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Prom", "NPS_Prom", "N"],
+                n=8
+            )
+
+    # -------------------------
+    # P3 - SKU fantasma
+    # -------------------------
+    p3_summary = "No hay datos suficientes."
+    p3_top_cat = "No hay datos suficientes."
+    if "sku_fantasma" in analysis_results and isinstance(analysis_results["sku_fantasma"], dict):
+        sf = analysis_results["sku_fantasma"]
+        p3_summary = (
+            f"Transacciones con SKU fantasma: {int(sf.get('num_transacciones', 0)):,}. "
+            f"Ingreso en riesgo: {float(sf.get('total_perdido', 0.0)):.2f} USD. "
+            f"% del ingreso total en riesgo: {float(sf.get('porcentaje', 0.0)) * 100:.2f}%."
+        )
+
+    if "sku_fantasma_por_categoria" in analysis_results and isinstance(analysis_results["sku_fantasma_por_categoria"], pd.DataFrame):
+        gc = analysis_results["sku_fantasma_por_categoria"].copy().sort_values("Ingreso_Perdido", ascending=False).head(10)
+        # Nota: la columna puede llamarse Categoria_fantasma o Categoria_clean, usamos lo que exista
+        cat_col = "Categoria_fantasma" if "Categoria_fantasma" in gc.columns else "Categoria_clean"
+        p3_top_cat = _df_top_to_text(gc, [cat_col, "Ingreso_Perdido"], n=10)
+
+    # -------------------------
+    # P4 - Stock alto y NPS bajo
+    # -------------------------
+    p4_alert_txt = "No hay datos suficientes."
+    if "stock_alto_nps_bajo_alerta" in analysis_results and isinstance(analysis_results["stock_alto_nps_bajo_alerta"], pd.DataFrame):
+        red = analysis_results["stock_alto_nps_bajo_alerta"].copy()
+        p4_alert_txt = _df_top_to_text(red, ["Categoria_clean", "Stock_Prom", "NPS_Prom", "N"], n=10)
+
+    # -------------------------
+    # P5 - Riesgo operativo por bodega
+    # -------------------------
+    p5_txt = "No hay datos suficientes."
+    if "riesgo_bodega_plus" in analysis_results and isinstance(analysis_results["riesgo_bodega_plus"], pd.DataFrame):
+        r = analysis_results["riesgo_bodega_plus"].copy()
+        r = r.sort_values("Ticket_Rate", ascending=False).head(10)
+        p5_txt = _df_top_to_text(r, ["Bodega_Origen_clean", "Ticket_Rate", "Tickets_Abiertos", "Total", "Dias_Revision_Prom", "NPS_Prom"], n=10)
+
+    user_summary = f"""
+RESUMEN EJECUTIVO (estadísticas agregadas)
+
+Contexto general:
+- Total de transacciones: {total_tx:,}
+- Ingreso total estimado: {total_ing:.2f} USD
+- Margen bruto total estimado: {total_margen:.2f} USD
+
+P1) Fuga de capital y rentabilidad (margen negativo):
+- {p1_counts if p1_counts else "Sin conteo disponible."}
+- Top SKUs con peor margen total:
+{p1_top_skus_txt}
+- Categorías con peor margen total:
+{p1_by_cat_txt}
+- Señal por canal (si aplica):
+{online_hint if online_hint else "No hay desglose por canal disponible."}
+
+P2) Crisis logística y cuellos de botella (tiempo entrega vs NPS):
+- Top combinaciones Ciudad–Bodega con mayor riesgo (tiempo alto + NPS bajo):
+{p2_txt}
+
+P3) Venta invisible (SKU fantasma):
+- {p3_summary}
+- Top categorías/segmentos asociados a ventas fantasma:
+{p3_top_cat}
+
+P4) Diagnóstico de fidelidad (stock alto + NPS bajo):
+- Categorías en alerta (alto stock y NPS <= 0):
+{p4_alert_txt}
+
+P5) Storytelling de riesgo operativo (revisión vs tickets):
+- Ranking bodegas por ticket rate + días desde revisión + NPS:
+{p5_txt}
+
+INSTRUCCIÓN:
+Entrega EXACTAMENTE 3 párrafos. 
+Cada párrafo debe contener recomendaciones numeradas con complejidad (Baja/Media/Alta). 
+Conecta explícitamente recomendaciones con los hallazgos anteriores.
+""".strip()
+
+    messages.append({"role": "user", "content": user_summary})
     return messages
+
 
 
 # -----------------------------------------------------------------------------
