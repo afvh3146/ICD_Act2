@@ -39,6 +39,12 @@ try:
 except Exception:
     REQUESTS_AVAILABLE = False
 
+# Optional charting lib (Altair) for better visuals (pie/donut/scatter with tooltips)
+try:
+    import altair as alt  # type: ignore
+    ALTAIR_AVAILABLE = True
+except Exception:
+    ALTAIR_AVAILABLE = False
 
 # -----------------------------------------------------------------------------
 # Helper Functions
@@ -212,6 +218,75 @@ def compute_health_metrics(
     report["health_score_raw"] = round(max(0, score_raw), 2)
     report["health_score_final"] = round(max(0, score_final), 2)
     return report
+
+def _fmt_money(x: float) -> str:
+    try:
+        return f"${x:,.2f}"
+    except Exception:
+        return str(x)
+
+def chart_bar(df: pd.DataFrame, x: str, y: str, title: str, height: int = 320):
+    st.markdown(f"#### {title}")
+    if df.empty or x not in df.columns or y not in df.columns:
+        st.info("No hay datos suficientes para este gráfico.")
+        return
+
+    if ALTAIR_AVAILABLE:
+        c = (
+            alt.Chart(df)
+            .mark_bar()
+            .encode(
+                x=alt.X(f"{x}:N", sort="-y", title=x),
+                y=alt.Y(f"{y}:Q", title=y),
+                tooltip=[x, y],
+            )
+            .properties(height=height)
+        )
+        st.altair_chart(c, use_container_width=True)
+    else:
+        st.bar_chart(df.set_index(x)[y])
+
+def chart_scatter(df: pd.DataFrame, x: str, y: str, color: str | None, size: str | None, title: str, height: int = 380):
+    st.markdown(f"#### {title}")
+    if df.empty or x not in df.columns or y not in df.columns:
+        st.info("No hay datos suficientes para este gráfico.")
+        return
+
+    if ALTAIR_AVAILABLE:
+        enc = {
+            "x": alt.X(f"{x}:Q", title=x),
+            "y": alt.Y(f"{y}:Q", title=y),
+            "tooltip": list(df.columns),
+        }
+        if color and color in df.columns:
+            enc["color"] = alt.Color(f"{color}:N", title=color)
+        if size and size in df.columns:
+            enc["size"] = alt.Size(f"{size}:Q", title=size)
+
+        c = alt.Chart(df).mark_circle(opacity=0.7).encode(**enc).properties(height=height)
+        st.altair_chart(c, use_container_width=True)
+    else:
+        # Fallback simple
+        st.scatter_chart(df[[x, y]].dropna())
+
+def chart_donut(df: pd.DataFrame, category_col: str, value_col: str, title: str, height: int = 320):
+    st.markdown(f"#### {title}")
+    if df.empty or category_col not in df.columns or value_col not in df.columns:
+        st.info("No hay datos suficientes para este gráfico.")
+        return
+
+    if not ALTAIR_AVAILABLE:
+        st.info("Altair no está disponible; mostrando tabla en su lugar.")
+        st.dataframe(df, use_container_width=True)
+        return
+
+    base = alt.Chart(df).encode(
+        theta=alt.Theta(f"{value_col}:Q"),
+        color=alt.Color(f"{category_col}:N", legend=alt.Legend(title=category_col)),
+        tooltip=[category_col, value_col],
+    )
+    donut = base.mark_arc(innerRadius=70).properties(height=height)
+    st.altair_chart(donut, use_container_width=True)
 
 
 # -----------------------------------------------------------------------------
@@ -752,6 +827,97 @@ def build_kpi_cards(df_joined: pd.DataFrame):
 def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
     """Compute summary statistics for the five management questions."""
     results: Dict[str, Any] = {}
+        # --- P1: Margen negativo (vista por categoría) + priorización por SKU ---
+    if "Categoria_clean" in df.columns and "Margen_Bruto" in df.columns:
+        by_cat = (
+            df.groupby("Categoria_clean", dropna=False)["Margen_Bruto"]
+            .sum()
+            .reset_index()
+            .rename(columns={"Margen_Bruto": "Margen_Total"})
+            .sort_values("Margen_Total")
+        )
+        results["margen_por_categoria"] = by_cat
+
+    if "SKU_ID" in df.columns and "Margen_Bruto" in df.columns and "Cantidad_Vendida" in df.columns:
+        by_sku = (
+            df.groupby("SKU_ID", dropna=False)
+            .agg(
+                Margen_Total=("Margen_Bruto", "sum"),
+                Cantidad_Total=("Cantidad_Vendida", "sum"),
+                Ingreso_Total=("Ingreso", "sum") if "Ingreso" in df.columns else ("Cantidad_Vendida", "sum"),
+            )
+            .reset_index()
+        )
+        results["sku_scatter_margen_vs_cantidad"] = by_sku
+
+        # --- P3: SKU fantasma por categoría (impacto en ingresos) ---
+    if "flag__sku_no_existe_en_inventario" in df.columns and "Ingreso" in df.columns:
+        ghost = df[df["flag__sku_no_existe_en_inventario"]].copy()
+        if "Categoria_clean" in ghost.columns:
+            ghost_by_cat = (
+                ghost.groupby("Categoria_clean", dropna=False)["Ingreso"]
+                .sum()
+                .reset_index()
+                .rename(columns={"Ingreso": "Ingreso_Perdido"})
+                .sort_values("Ingreso_Perdido", ascending=False)
+            )
+            results["sku_fantasma_por_categoria"] = ghost_by_cat
+
+        total_ing = float(df["Ingreso"].sum()) if float(df["Ingreso"].sum()) != 0 else 0.0
+        lost_ing = float(ghost["Ingreso"].sum())
+        donut_df = pd.DataFrame([
+            {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
+            {"Tipo": "Ingreso en riesgo (SKU fantasma)", "Valor": max(lost_ing, 0)},
+        ])
+        results["donut_ingreso_riesgo_fantasma"] = donut_df
+
+        # --- P4: Stock vs NPS por categoría (cuadrantes) ---
+    if "Stock_Actual" in df.columns and "Satisfaccion_NPS" in df.columns and "Categoria_clean" in df.columns:
+        cat_scatter = (
+            df.groupby("Categoria_clean", dropna=False)
+            .agg(
+                Stock_Prom=("Stock_Actual", "mean"),
+                NPS_Prom=("Satisfaccion_NPS", "mean"),
+                N=("Satisfaccion_NPS", "count"),
+            )
+            .reset_index()
+        )
+        results["stock_vs_nps_scatter"] = cat_scatter
+
+        # Cuadrante: alto stock (>= Q75) + bajo NPS (<= 0)
+        st_thr = float(df["Stock_Actual"].quantile(0.75))
+        red = cat_scatter[(cat_scatter["Stock_Prom"] >= st_thr) & (cat_scatter["NPS_Prom"] <= 0)].copy()
+        red = red.sort_values(["NPS_Prom", "Stock_Prom"], ascending=[True, False])
+        results["stock_alto_nps_bajo_alerta"] = red
+
+        # --- P5: Riesgo operativo (revisión vs tickets) + NPS por bodega (plus) ---
+    if "Bodega_Origen_clean" in df.columns:
+        if "Ticket_Soporte_bool" in df.columns:
+            b = df.copy()
+            b["Ticket_Soporte_bool"] = b["Ticket_Soporte_bool"].fillna(False)
+
+            agg = {
+                "Ticket_Soporte_bool": ["count", lambda x: int((x == True).sum())],
+            }
+            if "Dias_desde_revision" in b.columns:
+                agg["Dias_desde_revision"] = "mean"
+            if "Satisfaccion_NPS" in b.columns:
+                agg["Satisfaccion_NPS"] = "mean"
+
+            tmp = b.groupby("Bodega_Origen_clean", dropna=False).agg(agg)
+            tmp.columns = ["_".join([c for c in col if c]).strip() for col in tmp.columns.values]
+            tmp = tmp.reset_index()
+
+            tmp = tmp.rename(columns={
+                "Ticket_Soporte_bool_count": "Total",
+                "Ticket_Soporte_bool_<lambda_0>": "Tickets_Abiertos",
+                "Dias_desde_revision_mean": "Dias_Revision_Prom",
+                "Satisfaccion_NPS_mean": "NPS_Prom",
+            })
+
+            tmp["Ticket_Rate"] = tmp["Tickets_Abiertos"] / tmp["Total"].replace({0: np.nan})
+            results["riesgo_bodega_plus"] = tmp.sort_values("Ticket_Rate", ascending=False)
+    
     if df.empty:
         return results
 
@@ -1229,9 +1395,50 @@ def main() -> None:
                 f"% del ingreso total en riesgo: {info['porcentaje']*100:.2f}%"
             )
 
-        if "Margen_Bruto" in joined.columns:
-            st.markdown("#### Distribución de margen bruto")
-            st.bar_chart(joined["Margen_Bruto"].dropna().clip(-1e4, 1e4))
+                st.markdown("### 1️⃣ Margen negativo — insights accionables")
+
+        # P1: margen por categoría
+        if "margen_por_categoria" in analysis_results:
+            df_cat = analysis_results["margen_por_categoria"].copy()
+            # opcional: mostrar solo categorías con margen negativo al final
+            show_only_neg = st.checkbox("Mostrar solo categorías con margen total negativo", value=False, key="p1_only_neg_cat")
+            if show_only_neg:
+                df_cat = df_cat[df_cat["Margen_Total"] < 0]
+            chart_bar(df_cat, "Categoria_clean", "Margen_Total", "Margen total por categoría")
+
+        # P1: scatter por SKU (priorización)
+        if "sku_scatter_margen_vs_cantidad" in analysis_results:
+            by_sku = analysis_results["sku_scatter_margen_vs_cantidad"].copy()
+            show_only_neg_sku = st.checkbox("Mostrar solo SKUs con margen total negativo", value=True, key="p1_only_neg_sku")
+            if show_only_neg_sku:
+                by_sku = by_sku[by_sku["Margen_Total"] < 0]
+
+            topn = st.slider("Top N SKUs por impacto (|margen|)", 50, 500, 200, step=50, key="p1_topn_sku")
+            by_sku["abs_margen"] = by_sku["Margen_Total"].abs()
+            by_sku = by_sku.sort_values("abs_margen", ascending=False).head(topn)
+
+            chart_scatter(
+                by_sku,
+                x="Cantidad_Total",
+                y="Margen_Total",
+                color=None,
+                size="Ingreso_Total" if "Ingreso_Total" in by_sku.columns else None,
+                title="Prioriza SKUs: Cantidad total vs Margen total (tamaño = ingreso)",
+            )
+            st.caption("Interpretación: abajo (margen negativo) y a la derecha (alto volumen) = prioridad máxima.")
+
+        st.markdown("---")
+        st.markdown("### 3️⃣ Venta invisible (SKU fantasma) — exploración")
+
+        if "sku_fantasma_por_categoria" in analysis_results:
+            ghost_cat = analysis_results["sku_fantasma_por_categoria"].copy()
+            topc = st.slider("Top categorías por ingreso perdido", 5, 30, 10, key="p3_top_cat")
+            chart_bar(ghost_cat.head(topc), "Categoria_clean", "Ingreso_Perdido", "Ingresos perdidos por SKU fantasma (Top categorías)")
+
+        if "donut_ingreso_riesgo_fantasma" in analysis_results:
+            donut_df = analysis_results["donut_ingreso_riesgo_fantasma"].copy()
+            chart_donut(donut_df, "Tipo", "Valor", "Proporción del ingreso en riesgo por SKU fantasma")
+
 
     with tabs[2]:
         st.subheader("😊 Cliente")
@@ -1249,6 +1456,61 @@ def main() -> None:
             st.markdown("### 5️⃣ Riesgo operativo por bodega")
             risk_df = analysis_results["operational_risk"]
             st.dataframe(risk_df, use_container_width=True)
+                st.markdown("---")
+        st.markdown("### 2️⃣ Logística vs NPS — visual")
+
+        if "logistica_vs_nps" in analysis_results:
+            corr_df = analysis_results["logistica_vs_nps"].copy()
+            # agregar n si no existe
+            if "N" not in corr_df.columns:
+                corr_df["N"] = 1
+            chart_scatter(
+                corr_df,
+                x="Tiempo_Entrega_Prom",
+                y="NPS_Prom",
+                color="Bodega_Origen_clean",
+                size=None,
+                title="Tiempo de entrega promedio vs NPS promedio (por ciudad y bodega)",
+            )
+
+        st.markdown("---")
+        st.markdown("### 4️⃣ Stock alto y NPS bajo — cuadrantes")
+
+        if "stock_vs_nps_scatter" in analysis_results:
+            s = analysis_results["stock_vs_nps_scatter"].copy()
+            chart_scatter(
+                s,
+                x="Stock_Prom",
+                y="NPS_Prom",
+                color=None,
+                size="N",
+                title="Por categoría: Stock promedio vs NPS promedio (tamaño = n)",
+            )
+
+        if "stock_alto_nps_bajo_alerta" in analysis_results:
+            red = analysis_results["stock_alto_nps_bajo_alerta"]
+            st.markdown("**Categorías en alerta: alto stock + NPS bajo (<= 0)**")
+            st.dataframe(red, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("### 5️⃣ Riesgo operativo por bodega — (plus: NPS)")
+
+        if "riesgo_bodega_plus" in analysis_results:
+            r = analysis_results["riesgo_bodega_plus"].copy()
+            # gráfico bar ticket rate
+            show = r[["Bodega_Origen_clean", "Ticket_Rate"]].dropna().sort_values("Ticket_Rate", ascending=False)
+            chart_bar(show, "Bodega_Origen_clean", "Ticket_Rate", "Ticket rate por bodega (mayor = más riesgo)")
+
+            # scatter días vs ticket rate si existe
+            if "Dias_Revision_Prom" in r.columns and r["Dias_Revision_Prom"].notna().any():
+                rr = r.dropna(subset=["Dias_Revision_Prom", "Ticket_Rate"])
+                chart_scatter(rr, "Dias_Revision_Prom", "Ticket_Rate", None, None, "Días desde revisión (prom) vs Ticket rate")
+
+            # NPS por bodega (conexión cliente-operación)
+            if "NPS_Prom" in r.columns and r["NPS_Prom"].notna().any():
+                nps_df = r[["Bodega_Origen_clean", "NPS_Prom"]].dropna().sort_values("NPS_Prom")
+                chart_bar(nps_df, "Bodega_Origen_clean", "NPS_Prom", "NPS promedio por bodega (contexto)")
+
 
     with tabs[3]:
         st.subheader("🧠 Insights IA")
