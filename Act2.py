@@ -1380,7 +1380,6 @@ def main() -> None:
 
         with tabs[1]:
             st.subheader("📊 Operaciones")
-
             st.markdown("### 1️⃣ Margen negativo — insights accionables")
 
         # P1: margen por categoría
