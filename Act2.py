@@ -1379,18 +1379,18 @@ def main() -> None:
                 st.dataframe(fb_rare.head(200), use_container_width=True)
 
         with tabs[1]:
-        st.subheader("📊 Operaciones")
+            st.subheader("📊 Operaciones")
 
-        st.markdown("### 1️⃣ Margen negativo — insights accionables")
+            st.markdown("### 1️⃣ Margen negativo — insights accionables")
 
         # P1: margen por categoría
-        if "margen_por_categoria" in analysis_results:
-            df_cat = analysis_results["margen_por_categoria"].copy()
-            show_only_neg = st.checkbox(
-                "Mostrar solo categorías con margen total negativo",
-                value=False,
-                key="p1_only_neg_cat"
-            )
+            if "margen_por_categoria" in analysis_results:
+                df_cat = analysis_results["margen_por_categoria"].copy()
+                show_only_neg = st.checkbox(
+                    "Mostrar solo categorías con margen total negativo",
+                    value=False,
+                    key="p1_only_neg_cat"
+                )
             if show_only_neg:
                 df_cat = df_cat[df_cat["Margen_Total"] < 0]
 
