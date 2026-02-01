@@ -914,15 +914,29 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
             "porcentaje": float(lost_ing / total_ing) if total_ing != 0 else 0.0,
         }
 
-        if "Categoria_clean" in ghost.columns:
-            ghost_by_cat = (
-                ghost.groupby("Categoria_clean", dropna=False)["Ingreso"]
-                .sum()
-                .reset_index()
-                .rename(columns={"Ingreso": "Ingreso_Perdido"})
-                .sort_values("Ingreso_Perdido", ascending=False)
-            )
-            results["sku_fantasma_por_categoria"] = ghost_by_cat
+        if "flag__sku_no_existe_en_inventario" in d.columns:
+    ghost = d[d["flag__sku_no_existe_en_inventario"]].copy()
+
+    total_ing = float(d["Ingreso"].sum()) if float(d["Ingreso"].sum()) != 0 else 0.0
+    lost_ing = float(ghost["Ingreso"].sum()) if "Ingreso" in ghost.columns else 0.0
+
+    results["sku_fantasma"] = {
+        "total_perdido": lost_ing,
+        "num_transacciones": int(len(ghost)),
+        "porcentaje": float(lost_ing / total_ing) if total_ing != 0 else 0.0,
+    }
+
+    # ✅ CLAVE: si es fantasma, no hay categoría desde inventario
+    if "Categoria_clean" in ghost.columns:
+        ghost["Categoria_fantasma"] = ghost["Categoria_clean"].fillna("sin categoría (SKU no existe en inventario)")
+        ghost_by_cat = (
+            ghost.groupby("Categoria_fantasma", dropna=False)["Ingreso"]
+            .sum()
+            .reset_index()
+            .rename(columns={"Ingreso": "Ingreso_Perdido"})
+            .sort_values("Ingreso_Perdido", ascending=False)
+        )
+        results["sku_fantasma_por_categoria"] = ghost_by_cat
 
         donut_df = pd.DataFrame([
             {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
@@ -1444,7 +1458,7 @@ def main() -> None:
             topc = st.slider("Top categorías por ingreso perdido", 5, 30, 10, key="p3_top_cat")
             chart_bar(
                 ghost_cat.head(topc),
-                "Categoria_clean",
+                "Categoria_fantasma",
                 "Ingreso_Perdido",
                 "Ingresos perdidos por SKU fantasma (Top categorías)"
             )
