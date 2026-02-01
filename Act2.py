@@ -38,7 +38,7 @@ def safe_for_streamlit_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
-    
+
 UNKNOWN_TOKENS = {
     "???", "??", "?", "na", "n a", "none", "null", "unknown",
     "sin categoria", "sincategoria", "sin categoría",
@@ -146,27 +146,11 @@ def outlier_flag_iqr(df, col, k=1.5):
 def load_csv(uploaded_file) -> pd.DataFrame:
     return pd.read_csv(uploaded_file)
 
-def ordered_clean_view(df: pd.DataFrame, cleaned_cols: list, original_cols: list, flag_cols: list):
-    cleaned_cols = [c for c in cleaned_cols if c in df.columns]
-    original_cols = [c for c in original_cols if c in df.columns]
-    flag_cols = [c for c in flag_cols if c in df.columns]
-
-    in_any = set(cleaned_cols) | set(original_cols) | set(flag_cols)
-    extras = [c for c in df.columns if c not in in_any]
-
-    tail = []
-    if "has_any_flag" in df.columns and "has_any_flag" not in flag_cols:
-        tail.append("has_any_flag")
-
-    cols_final = dedupe_keep_order(cleaned_cols + original_cols + extras + flag_cols + tail)
-    view = df[cols_final].copy()
-    return safe_for_streamlit_df(view)
-
 def apply_exclusions_button(df, flag_cols, default_selected, key_prefix, help_text=None):
     """
-    - Permite seleccionar flags a excluir (checkboxes) dentro de un expander (colapsado por defecto)
-    - NO aplica hasta que el usuario presiona botón "Aplicar exclusiones"
-    - Retorna: df_final, applied_flags, applied_boolean
+    - Checkboxes dentro de expander (colapsado)
+    - NO aplica hasta que presiona botón
+    - Retorna df_final + flags aplicadas
     """
     state_key = f"{key_prefix}_applied_flags"
     if state_key not in st.session_state:
@@ -190,7 +174,11 @@ def apply_exclusions_button(df, flag_cols, default_selected, key_prefix, help_te
         applied_flags = st.session_state[state_key]
 
         if applied_flags:
-            st.info(f"Exclusiones activas ({len(applied_flags)}): " + ", ".join(applied_flags[:8]) + ("..." if len(applied_flags) > 8 else ""))
+            st.info(
+                f"Exclusiones activas ({len(applied_flags)}): "
+                + ", ".join(applied_flags[:8])
+                + ("..." if len(applied_flags) > 8 else "")
+            )
         else:
             st.info("Exclusiones activas: ninguna")
 
@@ -201,60 +189,6 @@ def apply_exclusions_button(df, flag_cols, default_selected, key_prefix, help_te
         df_final = df.copy()
 
     return df_final, applied_flags, False
-
-def render_dataset(title, df_raw, df_clean_all, df_final, df_rare, flag_cols, text_changes, cleaned_cols, original_cols, key_prefix):
-    st.subheader(title)
-    tabs = st.tabs(["📦 RAW", "🧼 LIMPIO (transformado)", "✅ FINAL", "⚠️ RAROS (tiene flags)", "🚩 Flags (ejemplos)", "🔁 Cambios (texto)"])
-
-    with tabs[0]:
-        st.caption("RAW: datos como llegaron.")
-        st.dataframe(df_raw.head(200), use_container_width=True)
-
-    with tabs[1]:
-        st.caption("LIMPIO (transformado): mismas filas, transformadas → originales → flags.")
-        view = ordered_clean_view(df_clean_all, cleaned_cols, original_cols, flag_cols)
-        st.dataframe(view.head(200), use_container_width=True)
-        st.markdown("### Conteo de flags")
-        if flag_cols:
-            st.dataframe(df_clean_all[flag_cols].sum().sort_values(ascending=False).to_frame("conteo"), use_container_width=True)
-
-    with tabs[2]:
-        st.caption("FINAL: aplica tus exclusiones (solo cuando presionas el botón).")
-        view = ordered_clean_view(df_final, cleaned_cols, original_cols, flag_cols)
-        st.dataframe(view.head(200), use_container_width=True)
-        st.write(f"Filas FINAL: {len(df_final):,} | Filas LIMPIO: {len(df_clean_all):,}")
-
-    with tabs[3]:
-        st.caption("RAROS: filas con al menos una flag.")
-        view = ordered_clean_view(df_rare, cleaned_cols, original_cols, flag_cols)
-        st.dataframe(view.head(200), use_container_width=True)
-        st.write(f"Filas RARAS: {len(df_rare):,}")
-
-    with tabs[4]:
-        if not flag_cols:
-            st.info("No hay flags para inspeccionar.")
-        else:
-            sel = st.selectbox("Selecciona un flag:", flag_cols, key=f"{key_prefix}_flag_picker")
-            flagged = df_clean_all[df_clean_all[sel] == True].copy()
-            st.write(f"Filas con **{sel}**: {len(flagged):,}")
-            st.dataframe(flagged.head(200), use_container_width=True)
-
-    with tabs[5]:
-        any_shown = False
-        for name, (orig, clean, fuzzy_df) in text_changes.items():
-            st.markdown(f"#### {name}")
-            if orig is None or clean is None:
-                st.caption("No aplica / no existe la columna.")
-                continue
-            any_shown = True
-            st.dataframe(changes_report(orig, clean).head(80), use_container_width=True)
-            if RAPIDFUZZ_AVAILABLE and isinstance(fuzzy_df, pd.DataFrame) and len(fuzzy_df) > 0:
-                st.caption("Sugerencias fuzzy (aplicadas / no aplicadas)")
-                st.dataframe(fuzzy_df.head(80), use_container_width=True)
-        if not any_shown:
-            st.info("No hay cambios de texto para mostrar.")
-        if not RAPIDFUZZ_AVAILABLE:
-            st.warning("Fuzzy matching no está activo (rapidfuzz no instalado).")
 
 # =========================
 # Sidebar: upload
@@ -276,15 +210,32 @@ st.success(f"Inventario cargado ✅ | {len(inv_raw):,} filas")
 st.success(f"Transacciones cargadas ✅ | {len(tx_raw):,} filas")
 st.success(f"Feedback cargado ✅ | {len(fb_raw):,} filas")
 
+# =====================================================
+# Configuración agrupada (expander padre)
+# =====================================================
 st.sidebar.divider()
-st.sidebar.header("🧾 Cómo estamos limpiando cada base")
+
+with st.sidebar.expander("⚙️ Configuración de la limpieza de datos", expanded=False):
+    st.caption("Configura opciones por base. Los datasets no se eliminan por flags a menos que lo apliques.")
+
+    # contenedores para ubicar widgets dentro de este expander padre
+    inv_cfg = st.container()
+    tx_cfg = st.container()
+    fb_cfg = st.container()
+    join_cfg = st.container()
+    doc_cfg = st.container()
 
 # =========================
 # INVENTARIO
 # =========================
-def process_inventario(df_raw: pd.DataFrame):
-    st.sidebar.subheader("Inventario — reglas")
-    fix_stock_abs = st.sidebar.checkbox("Stock: convertir negativo a positivo (abs) — opcional", value=False, key="inv_fix_abs")
+def process_inventario(df_raw: pd.DataFrame, cfg_container):
+    with cfg_container:
+        st.markdown("#### 📦 Inventario — opciones")
+        fix_stock_abs = st.checkbox(
+            "Stock: convertir negativo a positivo (abs) — opcional",
+            value=False,
+            key="inv_fix_abs"
+        )
 
     inv = df_raw.copy()
 
@@ -380,43 +331,33 @@ def process_inventario(df_raw: pd.DataFrame):
         help_text="Por defecto: outliers IQR están preseleccionados para excluir (pero NO se aplica hasta que presionas el botón)."
     )
 
-    cleaned_cols = [
-        "SKU_ID", "Categoria_clean", "Bodega_Origen_clean",
-        "Stock_Actual", "Costo_Unitario_USD", "Lead_Time_Dias", "Punto_Reorden", "Ultima_Revision",
-        "fix__stock_abs_applied"
-    ]
-    original_cols = ["Categoria_original", "Bodega_Origen_original"]
-    text_changes = {
-        "Categoria": (inv.get("Categoria_original"), inv.get("Categoria_clean"), cat_fuzzy),
-        "Bodega_Origen": (inv.get("Bodega_Origen_original"), inv.get("Bodega_Origen_clean"), bod_fuzzy),
-    }
     desc = [
         "Normalización texto automática (trim/lower/sin tildes/guiones→espacio/colapsa espacios).",
         "Diccionario + fuzzy (0.92, match único) en Categoria y Bodega_Origen (si rapidfuzz).",
         "Tipificación numérica (Stock/Costo/Lead/Punto) y fecha (Ultima_Revision).",
-        "Flags se calculan y se muestran; NO eliminan por defecto.",
+        "Flags se calculan; NO eliminan por defecto.",
         "Stock: opción de abs() si negativo (checkbox).",
         "Outliers IQR (k=1.5): se marcan con flag y vienen preseleccionados para excluir (pero solo al aplicar).",
     ]
 
-    return df_raw, inv, inv_final, inv_rare, flag_cols, text_changes, cleaned_cols, original_cols, desc
+    return df_raw, inv, inv_final, inv_rare, flag_cols, desc
 
 # =========================
 # TRANSACCIONES
 # =========================
-def process_transacciones(df_raw: pd.DataFrame):
-    st.sidebar.subheader("Transacciones — reglas")
-
-    strict_city = st.sidebar.checkbox(
-        "Ciudad desconocida/sospechosa → unknown (recomendado)",
-        value=True,
-        key="tx_strict_city"
-    )
-    fix_future_year = st.sidebar.checkbox(
-        "Venta futura: si año==2026 → cambiar a 2025 (checkbox de corrección)",
-        value=False,
-        key="tx_fix_future_year"
-    )
+def process_transacciones(df_raw: pd.DataFrame, cfg_container):
+    with cfg_container:
+        st.markdown("#### 🚚 Transacciones — opciones")
+        strict_city = st.checkbox(
+            "Ciudad desconocida/sospechosa → unknown (recomendado)",
+            value=True,
+            key="tx_strict_city"
+        )
+        fix_future_year = st.checkbox(
+            "Venta futura: si año==2026 → cambiar a 2025 (checkbox de corrección)",
+            value=False,
+            key="tx_fix_future_year"
+        )
 
     tx = df_raw.copy()
 
@@ -463,10 +404,6 @@ def process_transacciones(df_raw: pd.DataFrame):
 
     SUSPICIOUS_CITY_TOKENS = {"ventas", "web", "online", "app", "whatsapp", "canal"}
 
-    tx_city_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
-    tx_status_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
-    tx_canal_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
-
     if "Ciudad_Destino" in tx.columns:
         tx["Ciudad_Destino_norm"] = tx["Ciudad_Destino"].apply(normalize_text_keep_unknown)
 
@@ -482,13 +419,13 @@ def process_transacciones(df_raw: pd.DataFrame):
 
         tx["Ciudad_Destino_clean"] = apply_manual_map(tx["Ciudad_Destino_norm"], CITY_MAP)
         canonical = build_canonical_values(tx["Ciudad_Destino_clean"])
-        tx["Ciudad_Destino_clean"], tx_city_fuzzy = fuzzy_map_unique(tx["Ciudad_Destino_clean"], canonical, 0.92, 0.03)
+        tx["Ciudad_Destino_clean"], _ = fuzzy_map_unique(tx["Ciudad_Destino_clean"], canonical, 0.92, 0.03)
 
     if "Estado_Envio" in tx.columns:
         tx["Estado_Envio_clean"] = tx["Estado_Envio"].apply(normalize_text_keep_unknown)
         tx["Estado_Envio_clean"] = apply_manual_map(tx["Estado_Envio_clean"], STATUS_MAP)
         canonical = build_canonical_values(tx["Estado_Envio_clean"])
-        tx["Estado_Envio_clean"], tx_status_fuzzy = fuzzy_map_unique(tx["Estado_Envio_clean"], canonical, 0.92, 0.03)
+        tx["Estado_Envio_clean"], _ = fuzzy_map_unique(tx["Estado_Envio_clean"], canonical, 0.92, 0.03)
 
     if "Canal_Venta" in tx.columns:
         tx["Canal_Venta_clean"] = tx["Canal_Venta"].apply(normalize_text_keep_unknown)
@@ -496,7 +433,7 @@ def process_transacciones(df_raw: pd.DataFrame):
         norm_map.update({"tienda fisica": "tienda"})
         tx["Canal_Venta_clean"] = apply_manual_map(tx["Canal_Venta_clean"], norm_map)
         canonical = build_canonical_values(tx["Canal_Venta_clean"])
-        tx["Canal_Venta_clean"], tx_canal_fuzzy = fuzzy_map_unique(tx["Canal_Venta_clean"], canonical, 0.92, 0.03)
+        tx["Canal_Venta_clean"], _ = fuzzy_map_unique(tx["Canal_Venta_clean"], canonical, 0.92, 0.03)
 
     flag_cols = []
 
@@ -576,18 +513,6 @@ def process_transacciones(df_raw: pd.DataFrame):
         help_text="Cantidad negativa y tiempo outlier quedan para revisión (no se excluyen por defecto)."
     )
 
-    cleaned_cols = [
-        "Transaccion_ID", "SKU_ID",
-        "Fecha_Venta_dt", "Fecha_Venta_dt_fixed", "fix__venta_year_2026_to_2025",
-        "Cantidad_Vendida", "Precio_Venta_Final", "Costo_Envio", "Tiempo_Entrega_Real",
-        "Ciudad_Destino_clean", "Estado_Envio_clean", "Canal_Venta_clean"
-    ]
-    original_cols = ["Fecha_Venta", "Ciudad_Destino_original", "Estado_Envio_original", "Canal_Venta_original"]
-    text_changes = {
-        "Ciudad_Destino": (tx.get("Ciudad_Destino_original"), tx.get("Ciudad_Destino_clean"), tx_city_fuzzy),
-        "Estado_Envio": (tx.get("Estado_Envio_original"), tx.get("Estado_Envio_clean"), tx_status_fuzzy),
-        "Canal_Venta": (tx.get("Canal_Venta_original"), tx.get("Canal_Venta_clean"), tx_canal_fuzzy),
-    }
     desc = [
         "Fecha_Venta se parsea con dayfirst=True (dd/mm/yyyy).",
         "Normalización texto + diccionario + fuzzy (0.92, match único) para Ciudad/Estado/Canal.",
@@ -597,23 +522,22 @@ def process_transacciones(df_raw: pd.DataFrame):
         "Cantidad negativa y tiempo outlier se dejan para revisión (flags).",
     ]
 
-    return df_raw, tx, tx_final, tx_rare, flag_cols, text_changes, cleaned_cols, original_cols, desc
+    return df_raw, tx, tx_final, tx_rare, flag_cols, desc
 
 # =========================
 # FEEDBACK
 # =========================
-def process_feedback(df_raw: pd.DataFrame):
-    st.sidebar.subheader("Feedback — reglas")
-
-    fb_strategy = st.sidebar.selectbox(
-        "Estrategia feedback para JOIN por Transaccion_ID",
-        ["Agregar por Transaccion_ID (recomendado 1:1)", "Mantener 1:N"],
-        index=0,
-        key="fb_strategy"
-    )
-
-    fb_round_nps = st.sidebar.checkbox("NPS float → redondear a entero", value=True, key="fb_round_nps")
-    fb_placeholder_comment = st.sidebar.checkbox("Comentario placeholder ('---') → NaN", value=True, key="fb_comment_placeholder")
+def process_feedback(df_raw: pd.DataFrame, cfg_container):
+    with cfg_container:
+        st.markdown("#### 💬 Feedback — opciones")
+        fb_strategy = st.selectbox(
+            "Estrategia feedback para JOIN por Transaccion_ID",
+            ["Agregar por Transaccion_ID (recomendado 1:1)", "Mantener 1:N"],
+            index=0,
+            key="fb_strategy"
+        )
+        fb_round_nps = st.checkbox("NPS float → redondear a entero", value=True, key="fb_round_nps")
+        fb_placeholder_comment = st.checkbox("Comentario placeholder ('---') → NaN", value=True, key="fb_comment_placeholder")
 
     fb = df_raw.copy()
 
@@ -771,19 +695,6 @@ def process_feedback(df_raw: pd.DataFrame):
 
         fb_for_join = fb_for_join.groupby("Transaccion_ID_clean", dropna=False).agg(agg).reset_index()
 
-    cleaned_cols = [
-        "Transaccion_ID_clean",
-        "Rating_Producto", "Rating_Logistica", "Satisfaccion_NPS", "NPS_categoria",
-        "Edad_Cliente", "Recomienda_Marca_clean", "Ticket_Soporte_bool", "Comentario_Texto_clean"
-    ]
-    original_cols = ["Transaccion_ID_original", "Comentario_Texto_original", "Recomienda_Marca_original", "Ticket_Soporte_original"]
-
-    text_changes = {
-        "Recomienda_Marca": (fb.get("Recomienda_Marca_original"), fb.get("Recomienda_Marca_clean"), pd.DataFrame()),
-        "Ticket_Soporte_Abierto": (fb.get("Ticket_Soporte_original"), fb.get("Ticket_Soporte_bool"), pd.DataFrame()),
-        "Comentario_Texto": (fb.get("Comentario_Texto_original"), fb.get("Comentario_Texto_clean"), pd.DataFrame()),
-        "Transaccion_ID": (fb.get("Transaccion_ID_original"), fb.get("Transaccion_ID_clean"), pd.DataFrame()),
-    }
     desc = [
         "Transaccion_ID se preserva completo (string + strip), sin recortes.",
         "Normalización de Recomienda_Marca y Ticket_Soporte (boolean).",
@@ -792,71 +703,20 @@ def process_feedback(df_raw: pd.DataFrame):
         f"Estrategia de JOIN: {fb_strategy} (1:1 si se agrega).",
     ]
 
-    return df_raw, fb, fb_final, fb_rare, fb_for_join, flag_cols, text_changes, cleaned_cols, original_cols, desc
+    return df_raw, fb, fb_final, fb_rare, fb_for_join, flag_cols, desc
 
 # =========================
-# Ejecutar procesos
+# Ejecutar procesos (con widgets agrupados)
 # =========================
-inv_raw_out, inv_clean, inv_final, inv_rare, inv_flags, inv_text_changes, inv_cleaned_cols, inv_original_cols, inv_desc = process_inventario(inv_raw)
-tx_raw_out, tx_clean, tx_final, tx_rare, tx_flags, tx_text_changes, tx_cleaned_cols, tx_original_cols, tx_desc = process_transacciones(tx_raw)
-fb_raw_out, fb_clean, fb_final, fb_rare, fb_for_join, fb_flags, fb_text_changes, fb_cleaned_cols, fb_original_cols, fb_desc = process_feedback(fb_raw)
-
-# =========================
-# Sidebar: resumen de limpieza (desplegable + sub-desplegables)
-# =========================
-st.sidebar.divider()
-
-with st.sidebar.expander("🧾 Cómo estamos limpiando cada base (ver detalles)", expanded=False):
-
-    with st.expander("📦 Inventario — detalle", expanded=False):
-        st.markdown("\n".join([f"• {x}" for x in inv_desc]))
-
-        # opcional: checklist de decisiones tomadas (puedes editar texto)
-        with st.expander("✅ Decisiones / opciones del usuario (Inventario)", expanded=False):
-            st.markdown(
-                "- Stock negativo: opción **abs()** (si el usuario la activa).\n"
-                "- Outliers IQR: vienen **preseleccionados** para excluir (pero solo se excluyen si se aplica).\n"
-                "- Categorías/Bodega: normalización + diccionario + fuzzy (si rapidfuzz)."
-            )
-
-    with st.expander("🚚 Transacciones — detalle", expanded=False):
-        st.markdown("\n".join([f"• {x}" for x in tx_desc]))
-
-        with st.expander("✅ Decisiones / opciones del usuario (Transacciones)", expanded=False):
-            st.markdown(
-                "- Ciudad sospechosa/desconocida: marcar como **unknown** (recomendado).\n"
-                "- Venta futura: opción de corregir **2026 → 2025** (si el usuario la activa).\n"
-                "- Cantidad negativa y tiempo outlier: quedan para **revisión**, no se excluyen por defecto."
-            )
-
-    with st.expander("💬 Feedback — detalle", expanded=False):
-        st.markdown("\n".join([f"• {x}" for x in fb_desc]))
-
-        with st.expander("✅ Decisiones / opciones del usuario (Feedback)", expanded=False):
-            st.markdown(
-                "- Transaccion_ID: se conserva completo (string + strip).\n"
-                "- NPS: redondeo opcional + categoría (muy_negativo/neutral/positivo/excelente).\n"
-                "- Estrategia join: **agregar a 1:1** o mantener **1:N**."
-            )
+inv_raw_out, inv_clean, inv_final, inv_rare, inv_flags, inv_desc = process_inventario(inv_raw, inv_cfg)
+tx_raw_out, tx_clean, tx_final, tx_rare, tx_flags, tx_desc = process_transacciones(tx_raw, tx_cfg)
+fb_raw_out, fb_clean, fb_final, fb_rare, fb_for_join, fb_flags, fb_desc = process_feedback(fb_raw, fb_cfg)
 
 # =========================
-# UI principal: datasets
+# Config del JOIN dentro del expander padre
 # =========================
-st.markdown("## 1) Inventario")
-render_dataset("Inventario", inv_raw_out, inv_clean, inv_final, inv_rare, inv_flags, inv_text_changes, inv_cleaned_cols, inv_original_cols, "inv")
-
-st.markdown("## 2) Transacciones")
-render_dataset("Transacciones", tx_raw_out, tx_clean, tx_final, tx_rare, tx_flags, tx_text_changes, tx_cleaned_cols, tx_original_cols, "tx")
-
-st.markdown("## 3) Feedback")
-render_dataset("Feedback", fb_raw_out, fb_clean, fb_final, fb_rare, fb_flags, fb_text_changes, fb_cleaned_cols, fb_original_cols, "fb")
-
-# =========================
-# JOIN FINAL + lógica de "match ciudad por costo" después del join
-# =========================
-st.markdown("## 4) Join final + correcciones post-join")
-
-with st.sidebar.expander("🔗 Join — opciones post-join", expanded=True):
+with join_cfg:
+    st.markdown("#### 🔗 Join — opciones post-join")
     enable_city_by_cost = st.checkbox(
         "Después del join: inferir Ciudad por Costo_Envio cuando Ciudad=unknown (si el match es único)",
         value=True,
@@ -872,6 +732,23 @@ with st.sidebar.expander("🔗 Join — opciones post-join", expanded=True):
         min_value=2, max_value=100, value=5,
         key="join_city_min_support"
     )
+
+# =========================
+# Documentación dentro del expander padre (opcional)
+# =========================
+with doc_cfg:
+    st.markdown("#### 🧾 Cómo estamos limpiando (documentación)")
+    with st.expander("📦 Inventario — detalle", expanded=False):
+        st.markdown("\n".join([f"• {x}" for x in inv_desc]))
+    with st.expander("🚚 Transacciones — detalle", expanded=False):
+        st.markdown("\n".join([f"• {x}" for x in tx_desc]))
+    with st.expander("💬 Feedback — detalle", expanded=False):
+        st.markdown("\n".join([f"• {x}" for x in fb_desc]))
+
+# =====================================================
+# PANTALLA PRINCIPAL: SOLO JOIN FINAL
+# =====================================================
+st.header("✅ Dataset final (JOIN) — listo para análisis")
 
 # Normalizar IDs para join
 if "SKU_ID" in inv_final.columns:
