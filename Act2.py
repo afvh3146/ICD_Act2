@@ -561,8 +561,19 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     if "Fecha_Venta" in tx.columns:
         add_flag("fecha_venta_nula", tx["Fecha_Venta"].isna())
         add_flag("fecha_venta_invalida", tx["Fecha_Venta_dt"].isna() & tx["Fecha_Venta"].notna())
-        today = pd.Timestamp.utcnow().normalize()
-        add_flag("venta_futura", tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today))
+        # --- robust "today" as Timestamp (NOT datetime.date)
+today = pd.Timestamp.now().normalize()
+
+# --- ensure Fecha_Venta_dt is datetime64[ns] and tz-naive
+tx["Fecha_Venta_dt"] = pd.to_datetime(tx["Fecha_Venta"], errors="coerce", dayfirst=True)
+if hasattr(tx["Fecha_Venta_dt"].dt, "tz") and tx["Fecha_Venta_dt"].dt.tz is not None:
+    tx["Fecha_Venta_dt"] = tx["Fecha_Venta_dt"].dt.tz_localize(None)
+
+add_flag(
+    "venta_futura",
+    tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today)
+)
+
     # Numeric flags
     if "Cantidad_Vendida" in tx.columns:
         add_flag("cantidad_no_positiva", tx["Cantidad_Vendida"].notna() & (tx["Cantidad_Vendida"] <= 0))
