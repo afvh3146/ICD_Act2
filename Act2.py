@@ -836,7 +836,6 @@ def build_kpi_cards(df_joined: pd.DataFrame):
     col3.metric("SKU fantasma", f"{sku_fantasma:,}")
     col4.metric("Sin feedback", f"{sin_feedback:,}")
 
-
 def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
     """Compute summary statistics for P1..P5 + visuals-friendly tables."""
     results: Dict[str, Any] = {}
@@ -877,7 +876,9 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
             .reset_index()
         )
         results["sku_scatter_margen_vs_cantidad"] = by_sku
-        results["margen_negativo"] = by_sku[by_sku["Margen_Total"] < 0].sort_values("Margen_Total")
+        results["margen_negativo"] = (
+            by_sku[by_sku["Margen_Total"] < 0].sort_values("Margen_Total")
+        )
 
     # -------------------------
     # P2) Logística vs NPS
@@ -888,7 +889,10 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         and "Ciudad_Destino_clean" in d.columns
         and "Bodega_Origen_clean" in d.columns
     ):
-        df_corr = d[["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Real", "Satisfaccion_NPS"]].dropna()
+        df_corr = d[
+            ["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Real", "Satisfaccion_NPS"]
+        ].dropna()
+
         corr_table = (
             df_corr.groupby(["Ciudad_Destino_clean", "Bodega_Origen_clean"])
             .agg(
@@ -901,10 +905,11 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         results["logistica_vs_nps"] = corr_table
 
     # -------------------------
-    # P3) SKU fantasma
+    # P3) SKU fantasma (venta invisible)
     # -------------------------
     if "flag__sku_no_existe_en_inventario" in d.columns:
         ghost = d[d["flag__sku_no_existe_en_inventario"]].copy()
+
         total_ing = float(d["Ingreso"].sum()) if float(d["Ingreso"].sum()) != 0 else 0.0
         lost_ing = float(ghost["Ingreso"].sum()) if "Ingreso" in ghost.columns else 0.0
 
@@ -914,40 +919,42 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
             "porcentaje": float(lost_ing / total_ing) if total_ing != 0 else 0.0,
         }
 
-        if "flag__sku_no_existe_en_inventario" in d.columns:
-    ghost = d[d["flag__sku_no_existe_en_inventario"]].copy()
+        # Donut: ingreso normal vs ingreso en riesgo
+        donut_df = pd.DataFrame(
+            [
+                {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
+                {"Tipo": "Ingreso en riesgo (SKU fantasma)", "Valor": max(lost_ing, 0)},
+            ]
+        )
+        results["donut_ingreso_riesgo_fantasma"] = donut_df
 
-    total_ing = float(d["Ingreso"].sum()) if float(d["Ingreso"].sum()) != 0 else 0.0
-    lost_ing = float(ghost["Ingreso"].sum()) if "Ingreso" in ghost.columns else 0.0
+        # Nota clave: si el SKU no existe en inventario, muchas veces NO hay Categoria_clean válida.
+        # Creamos una categoría fallback para poder graficar/analizar.
+        if "Categoria_clean" in ghost.columns:
+            ghost["Categoria_fantasma"] = ghost["Categoria_clean"].fillna(
+                "sin categoría (SKU no existe en inventario)"
+            )
+        else:
+            ghost["Categoria_fantasma"] = "sin categoría (SKU no existe en inventario)"
 
-    results["sku_fantasma"] = {
-        "total_perdido": lost_ing,
-        "num_transacciones": int(len(ghost)),
-        "porcentaje": float(lost_ing / total_ing) if total_ing != 0 else 0.0,
-    }
-
-    # ✅ CLAVE: si es fantasma, no hay categoría desde inventario
-       if "Categoria_clean" in ghost.columns:
-           ghost["Categoria_fantasma"] = ghost["Categoria_clean"].fillna("sin categoría (SKU no existe en inventario)")
-           ghost_by_cat = (
-               ghost.groupby("Categoria_fantasma", dropna=False)["Ingreso"]
-               .sum()
-               .reset_index()
-               .rename(columns={"Ingreso": "Ingreso_Perdido"})
-               .sort_values("Ingreso_Perdido", ascending=False)
-           )
-           results["sku_fantasma_por_categoria"] = ghost_by_cat
-
-           donut_df = pd.DataFrame([
-               {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
-               {"Tipo": "Ingreso en riesgo (SKU fantasma)", "Valor": max(lost_ing, 0)},
-           ])
-           results["donut_ingreso_riesgo_fantasma"] = donut_df
+        if "Ingreso" in ghost.columns:
+            ghost_by_cat = (
+                ghost.groupby("Categoria_fantasma", dropna=False)["Ingreso"]
+                .sum()
+                .reset_index()
+                .rename(columns={"Ingreso": "Ingreso_Perdido"})
+                .sort_values("Ingreso_Perdido", ascending=False)
+            )
+            results["sku_fantasma_por_categoria"] = ghost_by_cat
 
     # -------------------------
     # P4) Stock vs NPS por categoría (cuadrantes)
     # -------------------------
-    if "Stock_Actual" in d.columns and "Satisfaccion_NPS" in d.columns and "Categoria_clean" in d.columns:
+    if (
+        "Stock_Actual" in d.columns
+        and "Satisfaccion_NPS" in d.columns
+        and "Categoria_clean" in d.columns
+    ):
         cat_scatter = (
             d.groupby("Categoria_clean", dropna=False)
             .agg(
@@ -959,8 +966,12 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         )
         results["stock_vs_nps_scatter"] = cat_scatter
 
-        st_thr = float(d["Stock_Actual"].quantile(0.75))
-        red = cat_scatter[(cat_scatter["Stock_Prom"] >= st_thr) & (cat_scatter["NPS_Prom"] <= 0)].copy()
+        # ✅ Umbral coherente: Q75 sobre el MISMO nivel de agregación (Stock_Prom por categoría)
+        stock_thr = float(cat_scatter["Stock_Prom"].quantile(0.75))
+
+        red = cat_scatter[
+            (cat_scatter["Stock_Prom"] >= stock_thr) & (cat_scatter["NPS_Prom"] <= 0)
+        ].copy()
         red = red.sort_values(["NPS_Prom", "Stock_Prom"], ascending=[True, False])
         results["stock_alto_nps_bajo_alerta"] = red
 
@@ -971,20 +982,24 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         b = d.copy()
         b["Ticket_Soporte_bool"] = b["Ticket_Soporte_bool"].fillna(False)
 
+        agg_dict: Dict[str, Any] = {
+            "Total": ("Ticket_Soporte_bool", "count"),
+            "Tickets_Abiertos": ("Ticket_Soporte_bool", lambda x: int((x == True).sum())),
+        }
+        if "Dias_desde_revision" in b.columns:
+            agg_dict["Dias_Revision_Prom"] = ("Dias_desde_revision", "mean")
+        if "Satisfaccion_NPS" in b.columns:
+            agg_dict["NPS_Prom"] = ("Satisfaccion_NPS", "mean")
+
         rows = (
             b.groupby("Bodega_Origen_clean", dropna=False)
-            .agg(
-                Total=("Ticket_Soporte_bool", "count"),
-                Tickets_Abiertos=("Ticket_Soporte_bool", lambda x: int((x == True).sum())),
-                Dias_Revision_Prom=("Dias_desde_revision", "mean") if "Dias_desde_revision" in b.columns else ("Ticket_Soporte_bool", "count"),
-                NPS_Prom=("Satisfaccion_NPS", "mean") if "Satisfaccion_NPS" in b.columns else ("Ticket_Soporte_bool", "count"),
-            )
+            .agg(**agg_dict)
             .reset_index()
         )
 
-        if "Dias_desde_revision" not in b.columns:
+        if "Dias_Revision_Prom" not in rows.columns:
             rows["Dias_Revision_Prom"] = np.nan
-        if "Satisfaccion_NPS" not in b.columns:
+        if "NPS_Prom" not in rows.columns:
             rows["NPS_Prom"] = np.nan
 
         rows["Ticket_Rate"] = rows["Tickets_Abiertos"] / rows["Total"].replace({0: np.nan})
