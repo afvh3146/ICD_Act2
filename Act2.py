@@ -558,21 +558,25 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     if "SKU_ID" in tx.columns:
         add_flag("sku_id_nulo", tx["SKU_ID"].isna())
     # Date flags
-    if "Fecha_Venta" in tx.columns:
-        add_flag("fecha_venta_nula", tx["Fecha_Venta"].isna())
-        add_flag("fecha_venta_invalida", tx["Fecha_Venta_dt"].isna() & tx["Fecha_Venta"].notna())
-        # --- robust "today" as Timestamp (NOT datetime.date)
-today = pd.Timestamp.now().normalize()
+    # Date flags
+if "Fecha_Venta" in tx.columns:
+    add_flag("fecha_venta_nula", tx["Fecha_Venta"].isna())
+    add_flag("fecha_venta_invalida", tx["Fecha_Venta_dt"].isna() & tx["Fecha_Venta"].notna())
 
-# --- ensure Fecha_Venta_dt is datetime64[ns] and tz-naive
-tx["Fecha_Venta_dt"] = pd.to_datetime(tx["Fecha_Venta"], errors="coerce", dayfirst=True)
-if hasattr(tx["Fecha_Venta_dt"].dt, "tz") and tx["Fecha_Venta_dt"].dt.tz is not None:
-    tx["Fecha_Venta_dt"] = tx["Fecha_Venta_dt"].dt.tz_localize(None)
+    # --- robust "today" as Timestamp (NOT datetime.date)
+    today = pd.Timestamp.now().normalize()
 
-add_flag(
-    "venta_futura",
-    tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today)
-)
+    # --- ensure Fecha_Venta_dt is datetime64[ns] and tz-naive
+    # (re-parse to be safe in case upstream logic changes)
+    tx["Fecha_Venta_dt"] = pd.to_datetime(tx["Fecha_Venta"], errors="coerce", dayfirst=True)
+    if getattr(tx["Fecha_Venta_dt"].dt, "tz", None) is not None:
+        tx["Fecha_Venta_dt"] = tx["Fecha_Venta_dt"].dt.tz_localize(None)
+
+    add_flag(
+        "venta_futura",
+        tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today)
+    )
+
 
     # Numeric flags
     if "Cantidad_Vendida" in tx.columns:
