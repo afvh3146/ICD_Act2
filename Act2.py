@@ -163,33 +163,44 @@ def ordered_clean_view(df: pd.DataFrame, cleaned_cols: list, original_cols: list
     return safe_for_streamlit_df(view)
 
 def apply_exclusions_button(df, flag_cols, default_selected, key_prefix, help_text=None):
-    st.sidebar.markdown(f"### {key_prefix}: flags para excluir del FINAL")
-    if help_text:
-        st.sidebar.caption(help_text)
-
-    selected = []
-    for fc in flag_cols:
-        pre = fc in default_selected
-        if st.sidebar.checkbox(f"Excluir si {fc}", value=pre, key=f"{key_prefix}_ex_{fc}"):
-            selected.append(fc)
-
-    applied = st.sidebar.button(f"✅ Aplicar exclusiones — {key_prefix}", key=f"{key_prefix}_apply_btn")
-
+    """
+    - Permite seleccionar flags a excluir (checkboxes) dentro de un expander (colapsado por defecto)
+    - NO aplica hasta que el usuario presiona botón "Aplicar exclusiones"
+    - Retorna: df_final, applied_flags, applied_boolean
+    """
     state_key = f"{key_prefix}_applied_flags"
     if state_key not in st.session_state:
         st.session_state[state_key] = []
 
-    if applied:
-        st.session_state[state_key] = selected
+    with st.sidebar.expander(f"🧰 {key_prefix}: excluir por flags (opcional)", expanded=False):
+        if help_text:
+            st.caption(help_text)
+
+        selected = []
+        for fc in flag_cols:
+            pre = fc in default_selected
+            if st.checkbox(f"Excluir si {fc}", value=pre, key=f"{key_prefix}_ex_{fc}"):
+                selected.append(fc)
+
+        applied = st.button(f"✅ Aplicar exclusiones — {key_prefix}", key=f"{key_prefix}_apply_btn")
+
+        if applied:
+            st.session_state[state_key] = selected
+
+        applied_flags = st.session_state[state_key]
+
+        if applied_flags:
+            st.info(f"Exclusiones activas ({len(applied_flags)}): " + ", ".join(applied_flags[:8]) + ("..." if len(applied_flags) > 8 else ""))
+        else:
+            st.info("Exclusiones activas: ninguna")
 
     applied_flags = st.session_state[state_key]
-
     if applied_flags:
         df_final = df[~df[applied_flags].any(axis=1)].copy()
     else:
         df_final = df.copy()
 
-    return df_final, applied_flags, applied
+    return df_final, applied_flags, False
 
 def render_dataset(title, df_raw, df_clean_all, df_final, df_rare, flag_cols, text_changes, cleaned_cols, original_cols, key_prefix):
     st.subheader(title)
