@@ -23,6 +23,22 @@ st.caption("Flags NO eliminan por defecto. Excluyes solo si lo seleccionas y pre
 # =========================
 # Helpers
 # =========================
+def dedupe_keep_order(cols):
+    """Elimina duplicados preservando el primer orden de aparición."""
+    seen = set()
+    out = []
+    for c in cols:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+def safe_for_streamlit_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Última defensa: si hay columnas duplicadas, se queda con la primera."""
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    return df
+    
 UNKNOWN_TOKENS = {
     "???", "??", "?", "na", "n a", "none", "null", "unknown",
     "sin categoria", "sincategoria", "sin categoría",
@@ -142,7 +158,9 @@ def ordered_clean_view(df: pd.DataFrame, cleaned_cols: list, original_cols: list
     if "has_any_flag" in df.columns and "has_any_flag" not in flag_cols:
         tail.append("has_any_flag")
 
-    return df[cleaned_cols + original_cols + extras + flag_cols + tail]
+    cols_final = dedupe_keep_order(cleaned_cols + original_cols + extras + flag_cols + tail)
+    view = df[cols_final].copy()
+    return safe_for_streamlit_df(view)
 
 def apply_exclusions_button(df, flag_cols, default_selected, key_prefix, help_text=None):
     st.sidebar.markdown(f"### {key_prefix}: flags para excluir del FINAL")
