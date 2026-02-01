@@ -1379,8 +1379,8 @@ def main() -> None:
                 st.dataframe(fb_rare.head(200), use_container_width=True)
 
         with tabs[1]:
-    st.subheader("📊 Operaciones")
-    st.markdown("### 1️⃣ Margen negativo — insights accionables")
+            st.subheader("📊 Operaciones")
+            st.markdown("### 1️⃣ Margen negativo — insights accionables")
 
     # P1: margen por categoría
     if "margen_por_categoria" in analysis_results:
@@ -1451,8 +1451,6 @@ def main() -> None:
             "Valor",
             "Proporción del ingreso en riesgo por SKU fantasma"
         )
-
-
 
 
     with tabs[2]:
