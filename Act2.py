@@ -47,6 +47,13 @@ try:
     ALTAIR_AVAILABLE = True
 except Exception:
     ALTAIR_AVAILABLE = False
+from io import BytesIO
+from PIL import Image  # type: ignore
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 
 # -----------------------------------------------------------------------------
@@ -211,6 +218,175 @@ def compute_health_metrics(
     report["health_score_raw"] = round(max(0, score_raw), 2)
     report["health_score_final"] = round(max(0, score_final), 2)
     return report
+def _wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float) -> float:
+    """Dibuja texto con saltos de línea automáticos. Devuelve el nuevo y."""
+    words = (text or "").split()
+    line = ""
+    for w in words:
+        test = (line + " " + w).strip()
+        if c.stringWidth(test, "Helvetica", 10) <= max_width:
+            line = test
+        else:
+            c.drawString(x, y, line)
+            y -= line_height
+            line = w
+    if line:
+        c.drawString(x, y, line)
+        y -= line_height
+    return y
+
+
+def generate_findings_pdf(
+    analysis_results: Dict[str, Any],
+    ai_text: str | None,
+    screenshots: List[bytes],
+) -> bytes:
+    """
+    Genera el PDF de hallazgos con narrativa + 4 imágenes.
+    screenshots: lista de bytes de imágenes (png/jpg) subidas por el usuario.
+    Retorna bytes del PDF.
+    """
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+
+    margin = 0.8 * inch
+    y = height - margin
+
+    # Portada / Encabezado
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(margin, y, "Documento de Hallazgos — Consultoría (Challenge 02)")
+    y -= 0.35 * inch
+
+    c.setFont("Helvetica", 10)
+    y = _wrap_text(
+        c,
+        "Este informe resume hallazgos críticos sobre rentabilidad, control de inventario, logística y riesgo operativo. "
+        "La evidencia proviene del dashboard y de estadísticas agregadas tras la limpieza e integración de datos.",
+        margin,
+        y,
+        width - 2 * margin,
+        14,
+    )
+    y -= 0.15 * inch
+
+    # Resumen ejecutivo con evidencia mínima
+    total_ing = 0.0
+    if "donut_ingreso_riesgo_fantasma" in analysis_results and isinstance(analysis_results["donut_ingreso_riesgo_fantasma"], pd.DataFrame):
+        dd = analysis_results["donut_ingreso_riesgo_fantasma"]
+        if "Valor" in dd.columns:
+            total_ing = float(dd["Valor"].sum())
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, "Resumen ejecutivo (evidencia)")
+    y -= 0.25 * inch
+    c.setFont("Helvetica", 10)
+
+    # P1
+    if "margen_negativo" in analysis_results and isinstance(analysis_results["margen_negativo"], pd.DataFrame):
+        mneg = analysis_results["margen_negativo"]
+        bullet = f"• P1 Rentabilidad: se identifican {len(mneg):,} SKUs con margen total negativo (requiere priorización)."
+    else:
+        bullet = "• P1 Rentabilidad: no hay datos suficientes para estimar margen negativo."
+    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
+
+    # P3
+    if "sku_fantasma" in analysis_results and isinstance(analysis_results["sku_fantasma"], dict):
+        sf = analysis_results["sku_fantasma"]
+        usd = float(sf.get("total_perdido", 0.0))
+        pct = float(sf.get("porcentaje", 0.0)) * 100
+        bullet = f"• P3 Venta invisible: ingreso en riesgo por SKU fantasma = {usd:,.2f} USD ({pct:.2f}% del ingreso)."
+    else:
+        bullet = "• P3 Venta invisible: no hay datos suficientes para cuantificar SKU fantasma."
+    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
+
+    # P2
+    if "logistica_vs_nps" in analysis_results and isinstance(analysis_results["logistica_vs_nps"], pd.DataFrame):
+        bullet = "• P2 Logística: se identifican zonas Ciudad–Bodega con tiempos altos y NPS bajo para intervención inmediata."
+    else:
+        bullet = "• P2 Logística: no hay datos suficientes para analizar tiempo de entrega vs NPS."
+    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
+
+    # P4
+    if "stock_alto_nps_bajo_alerta" in analysis_results and isinstance(analysis_results["stock_alto_nps_bajo_alerta"], pd.DataFrame):
+        red = analysis_results["stock_alto_nps_bajo_alerta"]
+        bullet = f"• P4 Fidelidad: categorías en alerta (alto stock + NPS <= 0): {len(red):,}."
+    else:
+        bullet = "• P4 Fidelidad: no hay evidencia suficiente de paradoja stock alto + NPS bajo."
+    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
+
+    # P5
+    if "riesgo_bodega_plus" in analysis_results and isinstance(analysis_results["riesgo_bodega_plus"], pd.DataFrame):
+        bullet = "• P5 Riesgo operativo: ranking de bodegas por ticket rate y antigüedad de revisión (operar a ciegas)."
+    else:
+        bullet = "• P5 Riesgo operativo: no hay datos suficientes de tickets/revisión por bodega."
+    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
+
+    y -= 0.15 * inch
+
+    # Insertar capturas (mínimo 4 recomendado)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, "Pruebas visuales (capturas del dashboard)")
+    y -= 0.25 * inch
+
+    img_max_w = width - 2 * margin
+    img_max_h = 2.6 * inch
+
+    for i, img_bytes in enumerate(screenshots[:6], start=1):
+        if y < (margin + img_max_h):
+            c.showPage()
+            y = height - margin
+
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(margin, y, f"Figura {i}")
+        y -= 0.15 * inch
+
+        try:
+            img = Image.open(BytesIO(img_bytes))
+            img_w, img_h = img.size
+            scale = min(img_max_w / img_w, img_max_h / img_h)
+            draw_w, draw_h = img_w * scale, img_h * scale
+
+            c.drawImage(
+                ImageReader(img),
+                margin,
+                y - draw_h,
+                width=draw_w,
+                height=draw_h,
+                preserveAspectRatio=True,
+                mask="auto",
+            )
+            y -= (draw_h + 0.25 * inch)
+        except Exception:
+            c.setFont("Helvetica", 10)
+            y = _wrap_text(c, f"[No se pudo renderizar la imagen {i}.]", margin, y, width - 2 * margin, 14)
+            y -= 0.2 * inch
+
+    # Plan de acción (3 recomendaciones)
+    if y < margin + 2.0 * inch:
+        c.showPage()
+        y = height - margin
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, "Plan de acción (3 recomendaciones priorizadas)")
+    y -= 0.25 * inch
+    c.setFont("Helvetica", 10)
+
+    if ai_text and isinstance(ai_text, str) and ai_text.strip():
+        # Usamos la IA como base (ya viene en 3 párrafos con recomendaciones)
+        y = _wrap_text(c, ai_text.strip(), margin, y, width - 2 * margin, 14)
+    else:
+        fallback = (
+            "1) (Baja) Corregir controles de maestro de inventario: bloquear ventas con SKU no registrado y auditar integraciones.\n"
+            "2) (Media) Revisión de pricing y promociones en canal web para SKUs con margen negativo, priorizando impacto por volumen.\n"
+            "3) (Alta) Rediseñar operación logística en la zona crítica (Ciudad–Bodega): cambio de operador / SLA y monitoreo NPS."
+        )
+        y = _wrap_text(c, fallback, margin, y, width - 2 * margin, 14)
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # -------------------------
@@ -1506,7 +1682,7 @@ def main() -> None:
     # -------------------------
     # Tabs
     # -------------------------
-    tabs = st.tabs(["🧮 Auditoría", "📊 Operaciones", "😊 Cliente", "🧠 Insights IA"])
+    tabs = st.tabs(["🧮 Auditoría", "📊 Operaciones", "😊 Cliente", "🧠 Insights IA", "📄 Documento PDF"])
 
     # --- Tab 0: Auditoría
     with tabs[0]:
@@ -1700,10 +1876,46 @@ def main() -> None:
         )
         if st.button("Generar recomendaciones con IA"):
             with st.spinner("Consultando al modelo..."):
-                prompt_messages = build_ai_prompt(joined)
+                prompt_messages = build_ai_prompt_from_analysis(joined, analysis_results)
                 ai_result = call_groq(prompt_messages)
                 st.text_area("Recomendaciones IA", value=ai_result, height=320)
+                st.session_state["ai_last_text"] = ai_result
+
 
 
 if __name__ == "__main__":
     main()
+    with tabs[4]:
+    st.subheader("📄 Documento de Hallazgos (PDF)")
+    st.write("Sube mínimo 4 capturas del dashboard (PNG/JPG). Luego genera el PDF para guardarlo en el repo.")
+
+    uploaded_imgs = st.file_uploader(
+        "Sube 4+ capturas (PNG/JPG)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="pdf_imgs"
+    )
+
+    # Guardar último texto IA para PDF (si existe)
+    if "ai_last_text" not in st.session_state:
+        st.session_state["ai_last_text"] = ""
+
+    st.caption("Tip: Genera primero recomendaciones con IA y luego crea el PDF para incluirlas como Plan de Acción.")
+
+    if st.button("📄 Generar PDF de Hallazgos", key="btn_make_pdf"):
+        if not uploaded_imgs or len(uploaded_imgs) < 4:
+            st.error("Necesitas subir al menos 4 capturas para cumplir el requisito.")
+        else:
+            img_bytes_list = [f.getvalue() for f in uploaded_imgs]
+            pdf_bytes = generate_findings_pdf(
+                analysis_results=analysis_results,
+                ai_text=st.session_state.get("ai_last_text"),
+                screenshots=img_bytes_list,
+            )
+            st.download_button(
+                "⬇️ Descargar hallazgos.pdf",
+                data=pdf_bytes,
+                file_name="hallazgos.pdf",
+                mime="application/pdf"
+            )
+  
