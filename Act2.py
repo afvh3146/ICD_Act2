@@ -552,41 +552,60 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
             return
         tx[cname] = mask.fillna(False).astype(bool)
         flag_cols.append(cname)
-    # Missing IDs
+        # Missing IDs
     if "Transaccion_ID" in tx.columns:
         add_flag("transaccion_id_nulo", tx["Transaccion_ID"].isna())
+
     if "SKU_ID" in tx.columns:
         add_flag("sku_id_nulo", tx["SKU_ID"].isna())
+
     # Date flags
-    # Date flags
-if "Fecha_Venta" in tx.columns:
-    add_flag("fecha_venta_nula", tx["Fecha_Venta"].isna())
-    add_flag("fecha_venta_invalida", tx["Fecha_Venta_dt"].isna() & tx["Fecha_Venta"].notna())
+    if "Fecha_Venta" in tx.columns:
+        add_flag("fecha_venta_nula", tx["Fecha_Venta"].isna())
+        add_flag(
+            "fecha_venta_invalida",
+            tx["Fecha_Venta_dt"].isna() & tx["Fecha_Venta"].notna()
+        )
 
-    # --- robust "today" as Timestamp (NOT datetime.date)
-    today = pd.Timestamp.now().normalize()
+        # Fecha actual como Timestamp (evita error datetime vs date)
+        today = pd.Timestamp.now().normalize()
 
-    # --- ensure Fecha_Venta_dt is datetime64[ns] and tz-naive
-    # (re-parse to be safe in case upstream logic changes)
-    tx["Fecha_Venta_dt"] = pd.to_datetime(tx["Fecha_Venta"], errors="coerce", dayfirst=True)
-    if getattr(tx["Fecha_Venta_dt"].dt, "tz", None) is not None:
-        tx["Fecha_Venta_dt"] = tx["Fecha_Venta_dt"].dt.tz_localize(None)
+        # Asegurar datetime64[ns] sin timezone
+        tx["Fecha_Venta_dt"] = pd.to_datetime(
+            tx["Fecha_Venta"], errors="coerce", dayfirst=True
+        )
+        if getattr(tx["Fecha_Venta_dt"].dt, "tz", None) is not None:
+            tx["Fecha_Venta_dt"] = tx["Fecha_Venta_dt"].dt.tz_localize(None)
 
-    add_flag(
-        "venta_futura",
-        tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today)
-    )
+        add_flag(
+            "venta_futura",
+            tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today)
+        )
 
-
-        # Numeric flags
+    # Numeric flags
     if "Cantidad_Vendida" in tx.columns:
-        add_flag("cantidad_no_positiva", tx["Cantidad_Vendida"].notna() & (tx["Cantidad_Vendida"] <= 0))
+        add_flag(
+            "cantidad_no_positiva",
+            tx["Cantidad_Vendida"].notna() & (tx["Cantidad_Vendida"] <= 0)
+        )
+
     if "Tiempo_Entrega_Real" in tx.columns:
-        add_flag("tiempo_negativo", tx["Tiempo_Entrega_Real"].notna() & (tx["Tiempo_Entrega_Real"] < 0))
-        add_flag("tiempo_outlier_iqr", outlier_flag_iqr(tx, "Tiempo_Entrega_Real", k=1.5))
+        add_flag(
+            "tiempo_negativo",
+            tx["Tiempo_Entrega_Real"].notna() & (tx["Tiempo_Entrega_Real"] < 0)
+        )
+        add_flag(
+            "tiempo_outlier_iqr",
+            outlier_flag_iqr(tx, "Tiempo_Entrega_Real", k=1.5)
+        )
+
     if "Costo_Envio" in tx.columns:
         add_flag("costo_nulo", tx["Costo_Envio"].isna())
-        add_flag("costo_no_positivo", tx["Costo_Envio"].notna() & (tx["Costo_Envio"] <= 0))
+        add_flag(
+            "costo_no_positivo",
+            tx["Costo_Envio"].notna() & (tx["Costo_Envio"] <= 0)
+        )
+
 
     # Unknown flags
     if "Ciudad_Destino_clean" in tx.columns:
