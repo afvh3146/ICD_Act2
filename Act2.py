@@ -1,17 +1,19 @@
 """
-Act2.py -- Streamlit dashboard for Challenge 02 (Data Cleaning, Integration and DSS)
-------------------------------------------------------------------------------
+Act2.py — Streamlit dashboard for Challenge 02 (Data Cleaning, Integration and DSS)
+----------------------------------------------------------------------------------
 
-This single-file Streamlit application encapsulates the entire data processing
-pipeline for the second challenge of your master's programme.  It performs
-auditable cleaning for three CSV sources (inventory, transactions and
-customer feedback), builds a reproducible join, exposes a health score
-before/after view, computes KPIs to answer management questions, and even
-offers the option to call an external LLM (Groq) for data-driven
-recommendations.  The file is heavily documented so another colleague can
-pick it up quickly.  To run locally simply execute:
-
-    streamlit run Act2.py
+Qué cubre esta versión (corregida y completa):
+1) Limpieza auditable (inventario, transacciones, feedback) con flags y exclusiones por botón.
+2) Health score (raw vs final) + descarga de reporte JSON.
+3) JOIN reproducible (Tx↔Inv↔Fb) + flags de SKU fantasma y sin feedback.
+4) Feature engineering (Ingreso, Costos, Margen, Días desde revisión).
+5) Visualizaciones “de nota alta” alineadas a P1..P5:
+   - P1: Margen negativo → bar por categoría + scatter priorización por SKU
+   - P2: Logística vs NPS → scatter (por ciudad/bodega, tamaño = N)
+   - P3: SKU fantasma → bar por categoría + donut proporción ingreso en riesgo
+   - P4: Stock vs NPS → scatter cuadrantes + tabla alerta (alto stock & NPS bajo)
+   - P5: Riesgo operativo → ticket rate por bodega + (opcional) días vs ticket rate + NPS por bodega
+6) IA opcional (Groq) con prompt basado en estadísticas agregadas (no se mandan filas crudas).
 """
 
 import os
@@ -19,7 +21,7 @@ import re
 import unicodedata
 import json
 from datetime import datetime
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, List, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -46,6 +48,7 @@ try:
 except Exception:
     ALTAIR_AVAILABLE = False
 
+
 # -----------------------------------------------------------------------------
 # Helper Functions
 # -----------------------------------------------------------------------------
@@ -57,16 +60,6 @@ UNKNOWN_TOKENS = {
 }
 
 
-def dedupe_keep_order(seq: List[str]) -> List[str]:
-    """Remove duplicates from a list while preserving order."""
-    seen, out = set(), []
-    for item in seq:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
 def safe_for_streamlit_df(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure there are no duplicate columns which confuse Streamlit tables."""
     if df.columns.duplicated().any():
@@ -76,9 +69,8 @@ def safe_for_streamlit_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_text_keep_unknown(x: Any) -> Any:
     """Normalise text by lowercasing, removing accents and punctuation.
-
-    Unknown tokens (e.g. '???', 'na', etc.) are mapped to the literal string
-    ``'unknown'``.  Empty strings and actual NA values propagate as NA.
+    Unknown tokens (e.g. '???', 'na', etc.) are mapped to the literal string 'unknown'.
+    Empty strings and actual NA values propagate as NA.
     """
     if pd.isna(x):
         return np.nan
@@ -88,6 +80,7 @@ def normalize_text_keep_unknown(x: Any) -> Any:
     raw_lower = raw.lower().strip()
     if raw_lower in UNKNOWN_TOKENS or (len(set(raw_lower)) == 1 and "?" in raw_lower):
         return "unknown"
+
     x2 = unicodedata.normalize("NFKD", raw_lower).encode("ascii", "ignore").decode("utf-8")
     x2 = re.sub(r"[-_/]+", " ", x2)
     x2 = re.sub(r"[^a-z0-9\s]", "", x2)
@@ -187,10 +180,10 @@ def compute_health_metrics(
     report["rows_raw"] = int(n_raw)
     report["rows_final"] = int(n_final)
 
-    dup_raw = raw_df.duplicated().sum()
-    dup_final = final_df.duplicated().sum()
-    report["duplicates_raw"] = int(dup_raw)
-    report["duplicates_final"] = int(dup_final)
+    dup_raw = int(raw_df.duplicated().sum())
+    dup_final = int(final_df.duplicated().sum())
+    report["duplicates_raw"] = dup_raw
+    report["duplicates_final"] = dup_final
 
     missing_raw = raw_df.isna().sum().to_dict()
     missing_final = final_df.isna().sum().to_dict()
@@ -219,59 +212,82 @@ def compute_health_metrics(
     report["health_score_final"] = round(max(0, score_final), 2)
     return report
 
-def _fmt_money(x: float) -> str:
-    try:
-        return f"${x:,.2f}"
-    except Exception:
-        return str(x)
+
+# -------------------------
+# Charts (Altair preferred)
+# -------------------------
 
 def chart_bar(df: pd.DataFrame, x: str, y: str, title: str, height: int = 320):
     st.markdown(f"#### {title}")
-    if df.empty or x not in df.columns or y not in df.columns:
+    if df is None or df.empty or x not in df.columns or y not in df.columns:
+        st.info("No hay datos suficientes para este gráfico.")
+        return
+
+    tmp = df[[x, y]].dropna().copy()
+    if tmp.empty:
         st.info("No hay datos suficientes para este gráfico.")
         return
 
     if ALTAIR_AVAILABLE:
         c = (
-            alt.Chart(df)
+            alt.Chart(tmp)
             .mark_bar()
             .encode(
                 x=alt.X(f"{x}:N", sort="-y", title=x),
                 y=alt.Y(f"{y}:Q", title=y),
-                tooltip=[x, y],
+                tooltip=[alt.Tooltip(f"{x}:N"), alt.Tooltip(f"{y}:Q")],
             )
             .properties(height=height)
         )
         st.altair_chart(c, use_container_width=True)
     else:
-        st.bar_chart(df.set_index(x)[y])
+        # fallback
+        st.bar_chart(tmp.set_index(x)[y])
 
-def chart_scatter(df: pd.DataFrame, x: str, y: str, color: str | None, size: str | None, title: str, height: int = 380):
+
+def chart_scatter(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    color: Optional[str],
+    size: Optional[str],
+    title: str,
+    height: int = 380
+):
     st.markdown(f"#### {title}")
-    if df.empty or x not in df.columns or y not in df.columns:
+    if df is None or df.empty or x not in df.columns or y not in df.columns:
         st.info("No hay datos suficientes para este gráfico.")
         return
 
+    tmp = df.copy()
+    tmp = tmp.replace([np.inf, -np.inf], np.nan)
+
+    # tooltip más amigable (evita 80 columnas)
+    tooltip_cols = [c for c in [x, y, color, size] if c and c in tmp.columns]
+    for extra in ["Categoria_clean", "Bodega_Origen_clean", "Ciudad_Destino_clean", "SKU_ID"]:
+        if extra in tmp.columns and extra not in tooltip_cols:
+            tooltip_cols.append(extra)
+
     if ALTAIR_AVAILABLE:
-        enc = {
+        enc: Dict[str, Any] = {
             "x": alt.X(f"{x}:Q", title=x),
             "y": alt.Y(f"{y}:Q", title=y),
-            "tooltip": list(df.columns),
+            "tooltip": [alt.Tooltip(f"{c}:N") if tmp[c].dtype == "object" else alt.Tooltip(f"{c}:Q") for c in tooltip_cols],
         }
-        if color and color in df.columns:
+        if color and color in tmp.columns:
             enc["color"] = alt.Color(f"{color}:N", title=color)
-        if size and size in df.columns:
+        if size and size in tmp.columns:
             enc["size"] = alt.Size(f"{size}:Q", title=size)
 
-        c = alt.Chart(df).mark_circle(opacity=0.7).encode(**enc).properties(height=height)
+        c = alt.Chart(tmp).mark_circle(opacity=0.7).encode(**enc).properties(height=height)
         st.altair_chart(c, use_container_width=True)
     else:
-        # Fallback simple
-        st.scatter_chart(df[[x, y]].dropna())
+        st.scatter_chart(tmp[[x, y]].dropna())
+
 
 def chart_donut(df: pd.DataFrame, category_col: str, value_col: str, title: str, height: int = 320):
     st.markdown(f"#### {title}")
-    if df.empty or category_col not in df.columns or value_col not in df.columns:
+    if df is None or df.empty or category_col not in df.columns or value_col not in df.columns:
         st.info("No hay datos suficientes para este gráfico.")
         return
 
@@ -283,19 +299,19 @@ def chart_donut(df: pd.DataFrame, category_col: str, value_col: str, title: str,
     base = alt.Chart(df).encode(
         theta=alt.Theta(f"{value_col}:Q"),
         color=alt.Color(f"{category_col}:N", legend=alt.Legend(title=category_col)),
-        tooltip=[category_col, value_col],
+        tooltip=[alt.Tooltip(f"{category_col}:N"), alt.Tooltip(f"{value_col}:Q")],
     )
     donut = base.mark_arc(innerRadius=70).properties(height=height)
     st.altair_chart(donut, use_container_width=True)
 
 
 # -----------------------------------------------------------------------------
-# Data processing functions
+# Data loading & exclusion UI
 # -----------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
 def load_csv(uploaded_file) -> pd.DataFrame:
-    """Load a CSV from an uploaded file.  Caches the result for speed."""
+    """Load a CSV from an uploaded file. Caches the result for speed."""
     return pd.read_csv(uploaded_file)
 
 
@@ -304,9 +320,9 @@ def apply_exclusions_button(
     flag_cols: List[str],
     default_selected: set,
     key_prefix: str,
-    help_text: str | None = None,
+    help_text: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, List[str], bool]:
-    """Interactive sidebar for flag exclusions."""
+    """Interactive sidebar for flag exclusions with an Apply button."""
     state_key = f"{key_prefix}_applied_flags"
     if state_key not in st.session_state:
         st.session_state[state_key] = []
@@ -314,6 +330,7 @@ def apply_exclusions_button(
     with st.sidebar.expander(f"🧰 {key_prefix}: excluir por flags", expanded=False):
         if help_text:
             st.caption(help_text)
+
         selected: List[str] = []
         for fc in flag_cols:
             pre = fc in default_selected
@@ -345,15 +362,17 @@ def apply_exclusions_button(
     return df_final, applied_flags, modified
 
 
+# -----------------------------------------------------------------------------
+# Processing — Inventario
+# -----------------------------------------------------------------------------
+
 def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str]
 ]:
     """Clean the inventory dataset and compute flags."""
     with cfg_container:
         st.markdown("#### 📦 Inventario — opciones")
-        fix_stock_abs = st.checkbox(
-            "Stock: convertir negativo a positivo (abs)", value=False, key="inv_fix_abs"
-        )
+        fix_stock_abs = st.checkbox("Stock: convertir negativo a positivo (abs)", value=False, key="inv_fix_abs")
 
     inv = df_raw.copy()
     actions: List[str] = []
@@ -384,7 +403,7 @@ def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         canonical = build_canonical_values(inv["Categoria_clean"])
         inv["Categoria_clean"], cat_fuzzy = fuzzy_map_unique(inv["Categoria_clean"], canonical, 0.92, 0.03)
         if not cat_fuzzy.empty:
-            actions.append("Fuzzy matching aplicado en Categoria (" + str(len(cat_fuzzy[cat_fuzzy["applied"]])) + " reemplazos)")
+            actions.append(f"Fuzzy matching en Categoria ({int((cat_fuzzy['applied']==True).sum())} reemplazos)")
 
     if "Bodega_Origen" in inv.columns:
         inv["Bodega_Origen_clean"] = inv["Bodega_Origen"].apply(normalize_text_keep_unknown)
@@ -392,7 +411,7 @@ def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         canonical = build_canonical_values(inv["Bodega_Origen_clean"])
         inv["Bodega_Origen_clean"], bod_fuzzy = fuzzy_map_unique(inv["Bodega_Origen_clean"], canonical, 0.92, 0.03)
         if not bod_fuzzy.empty:
-            actions.append("Fuzzy matching aplicado en Bodega_Origen (" + str(len(bod_fuzzy[bod_fuzzy["applied"]])) + " reemplazos)")
+            actions.append(f"Fuzzy matching en Bodega_Origen ({int((bod_fuzzy['applied']==True).sum())} reemplazos)")
 
     for c in ["Stock_Actual", "Costo_Unitario_USD", "Lead_Time_Dias", "Punto_Reorden"]:
         if c in inv.columns:
@@ -437,7 +456,7 @@ def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         m = inv["Stock_Actual"].notna() & (inv["Stock_Actual"] < 0)
         inv.loc[m, "Stock_Actual"] = inv.loc[m, "Stock_Actual"].abs()
         inv.loc[m, "fix__stock_abs_applied"] = True
-        actions.append(f"Stock negativo convertido a valor absoluto en {int(m.sum())} filas")
+        actions.append(f"Stock negativo → abs() en {int(m.sum())} filas")
 
     inv_rare = inv[inv["has_any_flag"]].copy()
 
@@ -447,20 +466,24 @@ def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         help_text="Por defecto se preseleccionan outliers de costo y lead time para excluir (requiere aplicar)."
     )
     if applied_flags:
-        actions.append("Exclusiones aplicadas en inventario: " + ", ".join(applied_flags))
+        actions.append("Exclusiones inventario: " + ", ".join(applied_flags))
 
     desc = [
-        "Normalización de texto (lowercase, sin tildes, reemplazo de guiones).",
+        "Normalización de texto (lowercase, sin tildes, limpieza de signos).",
         "Mapeo manual + fuzzy matching en Categoria y Bodega_Origen.",
-        "Conversión de columnas numéricas y de fechas.",
-        "Cálculo de flags para nulos, valores negativos, outliers IQR, unknown, etc.",
-        "Opción de convertir stock negativo a valor absoluto (no por defecto).",
-        "Outliers IQR preseleccionados para excluir mediante botón.",
+        "Conversión numérica y fecha (Ultima_Revision_dt).",
+        "Flags: nulos, negativos, outliers IQR, unknown.",
+        "Opcional: stock negativo → abs().",
+        "Exclusiones por botón (outliers preseleccionados).",
     ]
     desc.extend(actions)
 
     return df_raw, inv, inv_final, inv_rare, flag_cols, desc
 
+
+# -----------------------------------------------------------------------------
+# Processing — Transacciones
+# -----------------------------------------------------------------------------
 
 def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str]
@@ -468,12 +491,8 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     """Clean the transactions dataset and compute flags."""
     with cfg_container:
         st.markdown("#### 🚚 Transacciones — opciones")
-        strict_city = st.checkbox(
-            "Ciudad desconocida/sospechosa → unknown", value=True, key="tx_strict_city"
-        )
-        fix_future_year = st.checkbox(
-            "Venta futura: si año==2026 → cambiar a 2025", value=False, key="tx_fix_future_year"
-        )
+        strict_city = st.checkbox("Ciudad desconocida/sospechosa → unknown", value=True, key="tx_strict_city")
+        fix_future_year = st.checkbox("Venta futura: si año==2026 → cambiar a 2025", value=False, key="tx_fix_future_year")
 
     tx = df_raw.copy()
     actions: List[str] = []
@@ -554,13 +573,11 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         tx[cname] = mask.fillna(False).astype(bool)
         flag_cols.append(cname)
 
-    # Missing IDs
     if "Transaccion_ID" in tx.columns:
         add_flag("transaccion_id_nulo", tx["Transaccion_ID"].isna())
     if "SKU_ID" in tx.columns:
         add_flag("sku_id_nulo", tx["SKU_ID"].isna())
 
-    # Date flags
     if "Fecha_Venta" in tx.columns:
         add_flag("fecha_venta_nula", tx["Fecha_Venta"].isna())
         add_flag("fecha_venta_invalida", tx["Fecha_Venta_dt"].isna() & tx["Fecha_Venta"].notna())
@@ -568,14 +585,12 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         today = pd.Timestamp.now().normalize()
         add_flag("venta_futura", tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today))
 
-        # ✅ Fix opcional: si es futura y año==2026 → cambiar a 2025
         if fix_future_year:
             m_fix = tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"] > today) & (tx["Fecha_Venta_dt"].dt.year == 2026)
             if m_fix.any():
                 tx.loc[m_fix, "Fecha_Venta_dt"] = tx.loc[m_fix, "Fecha_Venta_dt"] - pd.DateOffset(years=1)
                 actions.append(f"Fechas futuras 2026→2025 corregidas en {int(m_fix.sum())} filas")
 
-    # Numeric flags
     if "Cantidad_Vendida" in tx.columns:
         add_flag("cantidad_no_positiva", tx["Cantidad_Vendida"].notna() & (tx["Cantidad_Vendida"] <= 0))
 
@@ -587,7 +602,6 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         add_flag("costo_nulo", tx["Costo_Envio"].isna())
         add_flag("costo_no_positivo", tx["Costo_Envio"].notna() & (tx["Costo_Envio"] <= 0))
 
-    # Unknown flags
     if "Ciudad_Destino_clean" in tx.columns:
         add_flag("ciudad_unknown", (tx["Ciudad_Destino_clean"].astype("string") == "unknown"))
     if "Estado_Envio_clean" in tx.columns:
@@ -601,25 +615,29 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     tx["has_any_flag"] = tx[flag_cols].any(axis=1) if flag_cols else False
     tx_rare = tx[tx["has_any_flag"]].copy()
 
-    default_exclude: set[str] = set()
+    default_exclude: set = set()
     tx_final, applied_flags, _ = apply_exclusions_button(
         tx, flag_cols, default_exclude, "Transacciones",
         help_text="Marca flags para excluir y presiona aplicar."
     )
     if applied_flags:
-        actions.append("Exclusiones aplicadas en transacciones: " + ", ".join(applied_flags))
+        actions.append("Exclusiones transacciones: " + ", ".join(applied_flags))
 
     desc = [
         "Fecha_Venta parseada con dayfirst=True (dd/mm/yyyy).",
         "Normalización de texto + mapeo + fuzzy para Ciudad/Estado/Canal.",
         "Detección de ciudades sospechosas (nombres de canal).",
-        "Cálculo de flags para fechas, cantidad, tiempos y costos.",
-        "Opción de corregir año 2026 a 2025 para ventas futuras (si se activa).",
+        "Flags: fechas (invalida/futura), cantidad, tiempos, costos, unknown.",
+        "Opcional: corregir año 2026→2025 en ventas futuras.",
     ]
     desc.extend(actions)
 
     return df_raw, tx, tx_final, tx_rare, flag_cols, desc
 
+
+# -----------------------------------------------------------------------------
+# Processing — Feedback
+# -----------------------------------------------------------------------------
 
 def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str]
@@ -634,9 +652,7 @@ def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
             key="fb_strategy"
         )
         fb_round_nps = st.checkbox("NPS float → redondear a entero", value=True, key="fb_round_nps")
-        fb_placeholder_comment = st.checkbox(
-            "Comentario placeholder ('---') → NaN", value=True, key="fb_comment_placeholder"
-        )
+        fb_placeholder_comment = st.checkbox("Comentario placeholder ('---') → NaN", value=True, key="fb_comment_placeholder")
 
     fb = df_raw.copy()
     actions: List[str] = []
@@ -720,10 +736,7 @@ def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         fb[cname] = mask.fillna(False).astype(bool)
         flag_cols.append(cname)
 
-    add_flag(
-        "transaccion_id_nulo",
-        fb["Transaccion_ID_clean"].isna() | (fb["Transaccion_ID_clean"].astype("string").str.len() == 0)
-    )
+    add_flag("transaccion_id_nulo", fb["Transaccion_ID_clean"].isna() | (fb["Transaccion_ID_clean"].astype("string").str.len() == 0))
     if "Feedback_ID" in fb.columns:
         add_flag("dup_feedback_id", fb["Feedback_ID"].notna() & fb["Feedback_ID"].duplicated(keep=False))
     add_flag("dup_transaccion_id", fb["Transaccion_ID_clean"].notna() & fb["Transaccion_ID_clean"].duplicated(keep=False))
@@ -749,13 +762,13 @@ def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     fb["has_any_flag"] = fb[flag_cols].any(axis=1) if flag_cols else False
     fb_rare = fb[fb["has_any_flag"]].copy()
 
-    default_exclude: set[str] = set()
+    default_exclude: set = set()
     fb_final, applied_flags, _ = apply_exclusions_button(
         fb, flag_cols, default_exclude, "Feedback",
         help_text="Marca flags para excluir. No excluimos nada por defecto."
     )
     if applied_flags:
-        actions.append("Exclusiones aplicadas en feedback: " + ", ".join(applied_flags))
+        actions.append("Exclusiones feedback: " + ", ".join(applied_flags))
 
     fb_for_join = fb_final.copy()
     fb_for_join["Transaccion_ID_clean"] = fb_for_join["Transaccion_ID_clean"].astype("string").str.strip()
@@ -795,9 +808,9 @@ def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
 
     desc = [
         "Transaccion_ID preservado (string + strip).",
-        "Normalización de Recomienda_Marca y Ticket_Soporte a valores consistentes.",
-        "NPS redondeado e interpretado en categorías detractor/neutral/promoter.",
-        "Cálculo de flags para duplicados, rangos de rating y NPS, comentarios faltantes, etc.",
+        "Normalización: Recomienda_Marca (yes/no/maybe/unknown) y Ticket_Soporte_bool.",
+        "NPS redondeado e interpretado en categorías.",
+        "Flags: duplicados, rangos rating/NPS, comentario faltante, ticket inválido, etc.",
         f"Estrategia de JOIN: {fb_strategy}.",
     ]
     desc.extend(actions)
@@ -806,13 +819,13 @@ def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
 
 
 # -----------------------------------------------------------------------------
-# Streamlit Application
+# KPIs & Analysis
 # -----------------------------------------------------------------------------
 
 def build_kpi_cards(df_joined: pd.DataFrame):
     """Display KPI cards summarising key metrics of the joined dataset."""
     df = df_joined.copy()
-    total_tx = len(df)
+    total_tx = int(len(df))
     margin_neg = int(df["Margen_Bruto"].lt(0).sum()) if "Margen_Bruto" in df.columns else 0
     sku_fantasma = int(df["flag__sku_no_existe_en_inventario"].sum()) if "flag__sku_no_existe_en_inventario" in df.columns else 0
     sin_feedback = int(df["flag__sin_feedback"].sum()) if "flag__sin_feedback" in df.columns else 0
@@ -825,12 +838,27 @@ def build_kpi_cards(df_joined: pd.DataFrame):
 
 
 def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
-    """Compute summary statistics for the five management questions."""
+    """Compute summary statistics for P1..P5 + visuals-friendly tables."""
     results: Dict[str, Any] = {}
-        # --- P1: Margen negativo (vista por categoría) + priorización por SKU ---
-    if "Categoria_clean" in df.columns and "Margen_Bruto" in df.columns:
+    if df is None or df.empty:
+        return results
+
+    d = df.copy()
+
+    # Safety defaults
+    if "Ingreso" not in d.columns:
+        d["Ingreso"] = 0.0
+    if "Margen_Bruto" not in d.columns:
+        d["Margen_Bruto"] = 0.0
+    if "Cantidad_Vendida" not in d.columns:
+        d["Cantidad_Vendida"] = 0.0
+
+    # -------------------------
+    # P1) Margen negativo
+    # -------------------------
+    if "Categoria_clean" in d.columns:
         by_cat = (
-            df.groupby("Categoria_clean", dropna=False)["Margen_Bruto"]
+            d.groupby("Categoria_clean", dropna=False)["Margen_Bruto"]
             .sum()
             .reset_index()
             .rename(columns={"Margen_Bruto": "Margen_Total"})
@@ -838,21 +866,54 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         )
         results["margen_por_categoria"] = by_cat
 
-    if "SKU_ID" in df.columns and "Margen_Bruto" in df.columns and "Cantidad_Vendida" in df.columns:
+    if "SKU_ID" in d.columns:
         by_sku = (
-            df.groupby("SKU_ID", dropna=False)
+            d.groupby("SKU_ID", dropna=False)
             .agg(
                 Margen_Total=("Margen_Bruto", "sum"),
                 Cantidad_Total=("Cantidad_Vendida", "sum"),
-                Ingreso_Total=("Ingreso", "sum") if "Ingreso" in df.columns else ("Cantidad_Vendida", "sum"),
+                Ingreso_Total=("Ingreso", "sum"),
             )
             .reset_index()
         )
         results["sku_scatter_margen_vs_cantidad"] = by_sku
+        results["margen_negativo"] = by_sku[by_sku["Margen_Total"] < 0].sort_values("Margen_Total")
 
-        # --- P3: SKU fantasma por categoría (impacto en ingresos) ---
-    if "flag__sku_no_existe_en_inventario" in df.columns and "Ingreso" in df.columns:
-        ghost = df[df["flag__sku_no_existe_en_inventario"]].copy()
+    # -------------------------
+    # P2) Logística vs NPS
+    # -------------------------
+    if (
+        "Tiempo_Entrega_Real" in d.columns
+        and "Satisfaccion_NPS" in d.columns
+        and "Ciudad_Destino_clean" in d.columns
+        and "Bodega_Origen_clean" in d.columns
+    ):
+        df_corr = d[["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Real", "Satisfaccion_NPS"]].dropna()
+        corr_table = (
+            df_corr.groupby(["Ciudad_Destino_clean", "Bodega_Origen_clean"])
+            .agg(
+                Tiempo_Entrega_Prom=("Tiempo_Entrega_Real", "mean"),
+                NPS_Prom=("Satisfaccion_NPS", "mean"),
+                N=("Satisfaccion_NPS", "count"),
+            )
+            .reset_index()
+        )
+        results["logistica_vs_nps"] = corr_table
+
+    # -------------------------
+    # P3) SKU fantasma
+    # -------------------------
+    if "flag__sku_no_existe_en_inventario" in d.columns:
+        ghost = d[d["flag__sku_no_existe_en_inventario"]].copy()
+        total_ing = float(d["Ingreso"].sum()) if float(d["Ingreso"].sum()) != 0 else 0.0
+        lost_ing = float(ghost["Ingreso"].sum()) if "Ingreso" in ghost.columns else 0.0
+
+        results["sku_fantasma"] = {
+            "total_perdido": lost_ing,
+            "num_transacciones": int(len(ghost)),
+            "porcentaje": float(lost_ing / total_ing) if total_ing != 0 else 0.0,
+        }
+
         if "Categoria_clean" in ghost.columns:
             ghost_by_cat = (
                 ghost.groupby("Categoria_clean", dropna=False)["Ingreso"]
@@ -863,18 +924,18 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
             )
             results["sku_fantasma_por_categoria"] = ghost_by_cat
 
-        total_ing = float(df["Ingreso"].sum()) if float(df["Ingreso"].sum()) != 0 else 0.0
-        lost_ing = float(ghost["Ingreso"].sum())
         donut_df = pd.DataFrame([
             {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
             {"Tipo": "Ingreso en riesgo (SKU fantasma)", "Valor": max(lost_ing, 0)},
         ])
         results["donut_ingreso_riesgo_fantasma"] = donut_df
 
-        # --- P4: Stock vs NPS por categoría (cuadrantes) ---
-    if "Stock_Actual" in df.columns and "Satisfaccion_NPS" in df.columns and "Categoria_clean" in df.columns:
+    # -------------------------
+    # P4) Stock vs NPS por categoría (cuadrantes)
+    # -------------------------
+    if "Stock_Actual" in d.columns and "Satisfaccion_NPS" in d.columns and "Categoria_clean" in d.columns:
         cat_scatter = (
-            df.groupby("Categoria_clean", dropna=False)
+            d.groupby("Categoria_clean", dropna=False)
             .agg(
                 Stock_Prom=("Stock_Actual", "mean"),
                 NPS_Prom=("Satisfaccion_NPS", "mean"),
@@ -884,109 +945,45 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         )
         results["stock_vs_nps_scatter"] = cat_scatter
 
-        # Cuadrante: alto stock (>= Q75) + bajo NPS (<= 0)
-        st_thr = float(df["Stock_Actual"].quantile(0.75))
+        st_thr = float(d["Stock_Actual"].quantile(0.75))
         red = cat_scatter[(cat_scatter["Stock_Prom"] >= st_thr) & (cat_scatter["NPS_Prom"] <= 0)].copy()
         red = red.sort_values(["NPS_Prom", "Stock_Prom"], ascending=[True, False])
         results["stock_alto_nps_bajo_alerta"] = red
 
-        # --- P5: Riesgo operativo (revisión vs tickets) + NPS por bodega (plus) ---
-    if "Bodega_Origen_clean" in df.columns:
-        if "Ticket_Soporte_bool" in df.columns:
-            b = df.copy()
-            b["Ticket_Soporte_bool"] = b["Ticket_Soporte_bool"].fillna(False)
+    # -------------------------
+    # P5) Riesgo operativo por bodega (ticket rate + NPS)
+    # -------------------------
+    if "Bodega_Origen_clean" in d.columns and "Ticket_Soporte_bool" in d.columns:
+        b = d.copy()
+        b["Ticket_Soporte_bool"] = b["Ticket_Soporte_bool"].fillna(False)
 
-            agg = {
-                "Ticket_Soporte_bool": ["count", lambda x: int((x == True).sum())],
-            }
-            if "Dias_desde_revision" in b.columns:
-                agg["Dias_desde_revision"] = "mean"
-            if "Satisfaccion_NPS" in b.columns:
-                agg["Satisfaccion_NPS"] = "mean"
-
-            tmp = b.groupby("Bodega_Origen_clean", dropna=False).agg(agg)
-            tmp.columns = ["_".join([c for c in col if c]).strip() for col in tmp.columns.values]
-            tmp = tmp.reset_index()
-
-            tmp = tmp.rename(columns={
-                "Ticket_Soporte_bool_count": "Total",
-                "Ticket_Soporte_bool_<lambda_0>": "Tickets_Abiertos",
-                "Dias_desde_revision_mean": "Dias_Revision_Prom",
-                "Satisfaccion_NPS_mean": "NPS_Prom",
-            })
-
-            tmp["Ticket_Rate"] = tmp["Tickets_Abiertos"] / tmp["Total"].replace({0: np.nan})
-            results["riesgo_bodega_plus"] = tmp.sort_values("Ticket_Rate", ascending=False)
-    
-    if df.empty:
-        return results
-
-    df = df.copy()
-    df["Ingreso"] = df.get("Ingreso", 0)
-    df["Margen_Bruto"] = df.get("Margen_Bruto", 0)
-    df["Cantidad_Vendida"] = df.get("Cantidad_Vendida", 0)
-
-    if "SKU_ID" in df.columns and "Margen_Bruto" in df.columns:
-        q1 = df.groupby("SKU_ID")["Margen_Bruto"].sum().reset_index().rename(columns={"Margen_Bruto": "Margen_Total"})
-        q1 = q1[q1["Margen_Total"] < 0].sort_values("Margen_Total")
-        results["margen_negativo"] = q1
-
-    if ("Tiempo_Entrega_Real" in df.columns and "Satisfaccion_NPS" in df.columns
-            and "Ciudad_Destino_clean" in df.columns and "Bodega_Origen_clean" in df.columns):
-        df_corr = df[["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Real", "Satisfaccion_NPS"]].dropna()
-        corr_table = (
-            df_corr.groupby(["Ciudad_Destino_clean", "Bodega_Origen_clean"])
-            .agg({"Tiempo_Entrega_Real": "mean", "Satisfaccion_NPS": "mean"})
-            .reset_index()
-            .rename(columns={"Tiempo_Entrega_Real": "Tiempo_Entrega_Prom", "Satisfaccion_NPS": "NPS_Prom"})
-        )
-        results["logistica_vs_nps"] = corr_table
-
-    if "flag__sku_no_existe_en_inventario" in df.columns and "Ingreso" in df.columns:
-        lost_sales = df[df["flag__sku_no_existe_en_inventario"]]
-        total_lost = float(lost_sales["Ingreso"].sum())
-        count_lost = int(len(lost_sales))
-        total_ing = float(df["Ingreso"].sum()) if float(df["Ingreso"].sum()) != 0 else 0.0
-        results["sku_fantasma"] = {
-            "total_perdido": total_lost,
-            "num_transacciones": count_lost,
-            "porcentaje": float(total_lost / total_ing) if total_ing != 0 else 0.0,
-        }
-
-    if ("Stock_Actual" in df.columns and "Satisfaccion_NPS" in df.columns and "Categoria_clean" in df.columns):
-        stock_threshold = df["Stock_Actual"].quantile(0.75)
-        low_nps_df = df[(df["Stock_Actual"] >= stock_threshold) & (df["Satisfaccion_NPS"] <= 0)]
-        quality_df = (
-            low_nps_df.groupby("Categoria_clean")
+        rows = (
+            b.groupby("Bodega_Origen_clean", dropna=False)
             .agg(
-                stock_prom=("Stock_Actual", "mean"),
-                nps_prom=("Satisfaccion_NPS", "mean"),
-                total_items=("Stock_Actual", "count"),
+                Total=("Ticket_Soporte_bool", "count"),
+                Tickets_Abiertos=("Ticket_Soporte_bool", lambda x: int((x == True).sum())),
+                Dias_Revision_Prom=("Dias_desde_revision", "mean") if "Dias_desde_revision" in b.columns else ("Ticket_Soporte_bool", "count"),
+                NPS_Prom=("Satisfaccion_NPS", "mean") if "Satisfaccion_NPS" in b.columns else ("Ticket_Soporte_bool", "count"),
             )
             .reset_index()
         )
-        results["stock_vs_nps"] = quality_df
 
-    if ("Ultima_Revision_dt" in df.columns and "Ticket_Soporte_bool" in df.columns and "Bodega_Origen_clean" in df.columns):
-        today = pd.Timestamp(datetime.now().date())
-        df_oper = df[["Ultima_Revision_dt", "Ticket_Soporte_bool", "Bodega_Origen_clean"]].dropna().copy()
-        df_oper["dias_desde_revision"] = (today - df_oper["Ultima_Revision_dt"].dt.floor("D")).dt.days
-        risk_table = (
-            df_oper.groupby("Bodega_Origen_clean")
-            .agg(
-                dias_prom=("dias_desde_revision", "mean"),
-                tickets_abiertos=("Ticket_Soporte_bool", lambda x: int((x == True).sum())),
-                total=("Ticket_Soporte_bool", "count"),
-            )
-            .reset_index()
-        )
-        risk_table["ticket_rate"] = risk_table["tickets_abiertos"] / risk_table["total"]
-        results["operational_risk"] = risk_table
+        if "Dias_desde_revision" not in b.columns:
+            rows["Dias_Revision_Prom"] = np.nan
+        if "Satisfaccion_NPS" not in b.columns:
+            rows["NPS_Prom"] = np.nan
+
+        rows["Ticket_Rate"] = rows["Tickets_Abiertos"] / rows["Total"].replace({0: np.nan})
+        results["riesgo_bodega_plus"] = rows.sort_values("Ticket_Rate", ascending=False)
 
     return results
 
 
-def get_groq_api_key() -> str | None:
+# -----------------------------------------------------------------------------
+# Groq (optional)
+# -----------------------------------------------------------------------------
+
+def get_groq_api_key() -> Optional[str]:
     """
     Devuelve la GROQ_API_KEY en este orden:
     1) key pegada en el sidebar (st.session_state)
@@ -1010,15 +1007,14 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
     api_key = get_groq_api_key()
     if not api_key:
         return (
-            "Error: No se encontró la clave GROQ_API_KEY en st.secrets ni en variables de entorno, "
-            "y no se pegó una key en el sidebar. Configúrala para usar IA."
+            "Error: No se encontró GROQ_API_KEY en st.secrets/variables de entorno, "
+            "y no se pegó una key en el sidebar."
         )
     if not REQUESTS_AVAILABLE:
         return "Error: la librería requests no está disponible en este entorno."
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
     model_id = st.session_state.get("groq_model_id", "llama-3.3-70b-versatile")
 
     payload = {
@@ -1041,19 +1037,18 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
 
 
 def build_ai_prompt(df: pd.DataFrame) -> List[Dict[str, str]]:
-    """Construct a summarised prompt for Groq based on filtered data."""
+    """Construct a summarised prompt for Groq based on filtered data (no raw rows)."""
     messages: List[Dict[str, str]] = []
     messages.append({
         "role": "system",
         "content": (
             "Eres un analista de datos senior que brinda recomendaciones de negocio "
             "basadas en estadísticas resumidas de ventas, inventario y feedback. "
-            "Nunca menciones que te dieron un resumen; simplemente responde con "
-            "tres párrafos de insights accionables para la gerencia."
+            "Responde con 3–5 bullets accionables y priorizados."
         ),
     })
 
-    total_tx = len(df)
+    total_tx = int(len(df))
     margen_total = float(df.get("Margen_Bruto", pd.Series(dtype=float)).sum())
     margen_neg_count = int((df.get("Margen_Bruto", pd.Series(dtype=float)) < 0).sum())
     sku_fantasma_count = int(df.get("flag__sku_no_existe_en_inventario", pd.Series(dtype=bool)).sum())
@@ -1064,28 +1059,30 @@ def build_ai_prompt(df: pd.DataFrame) -> List[Dict[str, str]]:
     messages.append({
         "role": "user",
         "content": (
-            f"Resumen de datos:\n"
-            f"- Total de transacciones: {total_tx}\n"
+            f"Resumen:\n"
+            f"- Total transacciones: {total_tx}\n"
             f"- Margen total (USD): {margen_total:.2f}\n"
-            f"- Transacciones con margen negativo: {margen_neg_count}\n"
-            f"- SKUs fantasma: {sku_fantasma_count}\n"
-            f"- Transacciones sin feedback: {sin_feedback_count}\n"
+            f"- # transacciones con margen negativo: {margen_neg_count}\n"
+            f"- # SKUs fantasma: {sku_fantasma_count}\n"
+            f"- # transacciones sin feedback: {sin_feedback_count}\n"
             f"- NPS promedio: {avg_nps:.2f}\n"
-            f"- Tiempo de entrega promedio: {avg_entrega:.2f}\n"
-            "Genera tres recomendaciones estratégicas basadas en estos datos."
+            f"- Tiempo entrega promedio: {avg_entrega:.2f}\n\n"
+            "Entrega recomendaciones para reducir margen negativo, mejorar NPS y disminuir riesgos operativos."
         ),
     })
     return messages
 
 
+# -----------------------------------------------------------------------------
+# Main App
+# -----------------------------------------------------------------------------
+
 def main() -> None:
-    """Entry point for the Streamlit app."""
     st.set_page_config(page_title="Challenge 02 — DSS Auditable", layout="wide")
-    st.title("Challenge 02 — DSS Auditable (Inventario + Transacciones + Feedback + Join)")
+    st.title("Challenge 02 — DSS Auditable (Inventario + Transacciones + Feedback + JOIN)")
     st.caption(
-        "Utiliza los controles laterales para limpiar los datos de manera auditable, "
-        "realizar el JOIN y analizar KPIs. Las exclusiones no se aplican hasta que "
-        "presiones los botones correspondientes."
+        "Controles laterales para limpieza auditable, JOIN y análisis. "
+        "Las exclusiones no se aplican hasta presionar 'Aplicar exclusiones'."
     )
 
     # Sidebar uploads
@@ -1095,8 +1092,7 @@ def main() -> None:
     uploaded_fb = st.sidebar.file_uploader("3) feedback_clientes_v2.csv", type=["csv"], key="up_fb")
 
     # -------------------------
-    # 🧠 IA (Groq) - Sidebar
-    # (va ANTES del return por falta de archivos)
+    # 🧠 IA (Groq) - Sidebar (antes del return)
     # -------------------------
     st.sidebar.divider()
     st.sidebar.subheader("🧠 IA (Groq)")
@@ -1115,11 +1111,11 @@ def main() -> None:
             "Pega tu GROQ_API_KEY (no se guarda)",
             type="password",
             value=st.session_state["groq_api_key_input"],
-            help="Se usa solo en esta sesión. Para producción, configura st.secrets o variables de entorno."
+            help="Se usa solo en esta sesión. Para producción, usa st.secrets o variables de entorno."
         )
         st.sidebar.caption("✅ La clave se usa solo mientras la app está abierta.")
     else:
-        st.sidebar.success("GROQ_API_KEY detectada en secrets o variables de entorno.")
+        st.sidebar.success("GROQ_API_KEY detectada en secrets/variables de entorno.")
 
     st.session_state["groq_model_id"] = st.sidebar.selectbox(
         "Modelo",
@@ -1167,6 +1163,7 @@ def main() -> None:
     st.success(f"Transacciones cargadas ✅ | {len(tx_raw):,} filas")
     st.success(f"Feedback cargado ✅ | {len(fb_raw):,} filas")
 
+    # Config containers
     st.sidebar.divider()
     with st.sidebar.expander("⚙️ Configuración de la limpieza de datos", expanded=False):
         st.caption("Configura opciones por base. Los datasets no se eliminan por flags a menos que lo apliques.")
@@ -1176,14 +1173,17 @@ def main() -> None:
         join_cfg = st.container()
         doc_cfg = st.container()
 
+    # Process each dataset
     inv_raw_out, inv_clean, inv_final, inv_rare, inv_flags, inv_desc = process_inventario(inv_raw, inv_cfg)
     tx_raw_out, tx_clean, tx_final, tx_rare, tx_flags, tx_desc = process_transacciones(tx_raw, tx_cfg)
     fb_raw_out, fb_clean, fb_final, fb_rare, fb_for_join, fb_flags, fb_desc = process_feedback(fb_raw, fb_cfg)
 
+    # Health reports
     inv_health = compute_health_metrics(inv_raw_out, inv_clean, inv_final, inv_flags)
     tx_health = compute_health_metrics(tx_raw_out, tx_clean, tx_final, tx_flags)
     fb_health = compute_health_metrics(fb_raw_out, fb_clean, fb_final, fb_flags)
 
+    # Join configuration
     with join_cfg:
         st.markdown("#### 🔗 Join — opciones post-join")
         enable_city_by_cost = st.checkbox(
@@ -1204,6 +1204,7 @@ def main() -> None:
             key="join_city_min_support",
         )
 
+    # Documentation expander
     with doc_cfg:
         st.markdown("#### 🧾 Cómo estamos limpiando (documentación)")
         with st.expander("📦 Inventario — detalle", expanded=False):
@@ -1213,11 +1214,15 @@ def main() -> None:
         with st.expander("💬 Feedback — detalle", expanded=False):
             st.markdown("\n".join([f"• {x}" for x in fb_desc]))
 
+    # -------------------------
+    # JOIN
+    # -------------------------
     st.header("✅ Dataset final (JOIN) — listo para análisis")
 
     if "SKU_ID" not in inv_final.columns:
         st.error("Inventario no tiene SKU_ID.")
         return
+
     invj = inv_final.copy()
     invj["SKU_ID"] = invj["SKU_ID"].astype("string").str.strip()
 
@@ -1240,12 +1245,15 @@ def main() -> None:
         return
     fbj["Transaccion_ID"] = fbj["Transaccion_ID"].astype("string").str.strip()
 
+    # Tx ↔ Inv
     join_tx_inv = txj.merge(invj, on="SKU_ID", how="left", suffixes=("_tx", "_inv"), indicator="merge_tx_inv")
     join_tx_inv["flag__sku_no_existe_en_inventario"] = (join_tx_inv["merge_tx_inv"] == "left_only")
 
+    # (Tx+Inv) ↔ Feedback
     joined = join_tx_inv.merge(fbj, on="Transaccion_ID", how="left", indicator="merge_tx_fb")
     joined["flag__sin_feedback"] = (joined["merge_tx_fb"] == "left_only")
 
+    # Post-join: optional city inference via shipping cost
     joined["Ciudad_inferida_por_costo"] = np.nan
     joined["flag__ciudad_inferida_por_costo"] = False
 
@@ -1286,6 +1294,9 @@ def main() -> None:
                     if overwrite_unknown_city:
                         joined.at[idx, "Ciudad_Destino_clean"] = city_by_cost[cost_val]
 
+    # -------------------------
+    # Feature engineering
+    # -------------------------
     joined["Cantidad_Vendida"] = pd.to_numeric(joined.get("Cantidad_Vendida", 0), errors="coerce")
     joined["Precio_Venta_Final"] = pd.to_numeric(joined.get("Precio_Venta_Final", 0), errors="coerce")
     joined["Costo_Unitario_USD"] = pd.to_numeric(joined.get("Costo_Unitario_USD", 0), errors="coerce")
@@ -1301,13 +1312,19 @@ def main() -> None:
         today_dt = pd.Timestamp(datetime.now().date())
         joined["Dias_desde_revision"] = (today_dt - joined["Ultima_Revision_dt"].dt.floor("D")).dt.days
 
+    # KPI cards + analysis
     build_kpi_cards(joined)
     analysis_results = compute_analysis(joined)
 
+    # -------------------------
+    # Tabs
+    # -------------------------
     tabs = st.tabs(["🧮 Auditoría", "📊 Operaciones", "😊 Cliente", "🧠 Insights IA"])
 
+    # --- Tab 0: Auditoría
     with tabs[0]:
         st.subheader("Auditoría de datos")
+
         health_df = pd.DataFrame([
             {
                 "Dataset": "Inventario",
@@ -1343,6 +1360,7 @@ def main() -> None:
                 "Health Score (final)": fb_health["health_score_final"],
             },
         ])
+
         st.dataframe(health_df, use_container_width=True)
 
         audit_report = {
@@ -1351,12 +1369,14 @@ def main() -> None:
             "feedback": fb_health,
             "generated_at": datetime.now().isoformat(),
         }
+
         st.download_button(
             label="📥 Descargar reporte de auditoría (JSON)",
             data=json.dumps(audit_report, indent=2),
             file_name="audit_report.json",
             mime="application/json",
         )
+
         st.download_button(
             label="📥 Descargar dataset JOIN (CSV)",
             data=joined.to_csv(index=False).encode("utf-8"),
@@ -1365,56 +1385,37 @@ def main() -> None:
         )
 
         with st.expander("🚩 Filas con flags (muestras)"):
-            sel_dataset = st.selectbox(
-                "Elige el dataset para mostrar flags", ["Inventario", "Transacciones", "Feedback"], key="aud_sel_dataset"
-            )
+            sel_dataset = st.selectbox("Elige dataset", ["Inventario", "Transacciones", "Feedback"], key="aud_sel_dataset")
             if sel_dataset == "Inventario":
                 st.write(f"Filas con flags: {len(inv_rare):,}")
-                st.dataframe(inv_rare.head(200), use_container_width=True)
+                st.dataframe(safe_for_streamlit_df(inv_rare.head(200)), use_container_width=True)
             elif sel_dataset == "Transacciones":
                 st.write(f"Filas con flags: {len(tx_rare):,}")
-                st.dataframe(tx_rare.head(200), use_container_width=True)
+                st.dataframe(safe_for_streamlit_df(tx_rare.head(200)), use_container_width=True)
             else:
                 st.write(f"Filas con flags: {len(fb_rare):,}")
-                st.dataframe(fb_rare.head(200), use_container_width=True)
+                st.dataframe(safe_for_streamlit_df(fb_rare.head(200)), use_container_width=True)
 
-        with tabs[1]:
-            st.subheader("📊 Operaciones")
-            st.markdown("### 1️⃣ Margen negativo — insights accionables")
+    # --- Tab 1: Operaciones (P1 + P3)
+    with tabs[1]:
+        st.subheader("📊 Operaciones")
 
-    # P1: margen por categoría
-            if "margen_por_categoria" in analysis_results:
-                df_cat = analysis_results["margen_por_categoria"].copy()
-                show_only_neg = st.checkbox(
-                    "Mostrar solo categorías con margen total negativo",
-                    value=False,
-                    key="p1_only_neg_cat"
-                )
+        st.markdown("### 1️⃣ Margen negativo — insights accionables")
+
+        if "margen_por_categoria" in analysis_results:
+            df_cat = analysis_results["margen_por_categoria"].copy()
+            show_only_neg = st.checkbox("Mostrar solo categorías con margen total negativo", value=False, key="p1_only_neg_cat")
             if show_only_neg:
                 df_cat = df_cat[df_cat["Margen_Total"] < 0]
+            chart_bar(df_cat, "Categoria_clean", "Margen_Total", "Margen total por categoría")
 
-            chart_bar(
-                df_cat,
-                "Categoria_clean",
-                "Margen_Total",
-                "Margen total por categoría"
-            )
-
-    # P1: scatter por SKU (priorización)
-            if "sku_scatter_margen_vs_cantidad" in analysis_results:
-                by_sku = analysis_results["sku_scatter_margen_vs_cantidad"].copy()
-                show_only_neg_sku = st.checkbox(
-                    "Mostrar solo SKUs con margen total negativo",
-                    value=True,
-                    key="p1_only_neg_sku"
-                )
+        if "sku_scatter_margen_vs_cantidad" in analysis_results:
+            by_sku = analysis_results["sku_scatter_margen_vs_cantidad"].copy()
+            show_only_neg_sku = st.checkbox("Mostrar solo SKUs con margen total negativo", value=True, key="p1_only_neg_sku")
             if show_only_neg_sku:
                 by_sku = by_sku[by_sku["Margen_Total"] < 0]
 
-            topn = st.slider(
-                "Top N SKUs por impacto (|margen|)",
-                50, 500, 200, step=50, key="p1_topn_sku"
-            )
+            topn = st.slider("Top N SKUs por impacto (|margen|)", 50, 500, 200, step=50, key="p1_topn_sku")
             by_sku["abs_margen"] = by_sku["Margen_Total"].abs()
             by_sku = by_sku.sort_values("abs_margen", ascending=False).head(topn)
 
@@ -1424,18 +1425,23 @@ def main() -> None:
                 y="Margen_Total",
                 color=None,
                 size="Ingreso_Total" if "Ingreso_Total" in by_sku.columns else None,
-                title="Prioriza SKUs: Cantidad total vs Margen total (tamaño = ingreso)",
+                title="Prioriza SKUs: Cantidad total vs Margen total (tamaño = ingreso)"
             )
 
         st.markdown("---")
         st.markdown("### 3️⃣ Venta invisible (SKU fantasma)")
 
+        if "sku_fantasma" in analysis_results:
+            info = analysis_results["sku_fantasma"]
+            st.write(
+                f"Transacciones con SKU fantasma: **{info['num_transacciones']:,}**  \n"
+                f"Ingreso en riesgo: **USD {info['total_perdido']:,.2f}**  \n"
+                f"% del ingreso total en riesgo: **{info['porcentaje']*100:.2f}%**"
+            )
+
         if "sku_fantasma_por_categoria" in analysis_results:
             ghost_cat = analysis_results["sku_fantasma_por_categoria"].copy()
-            topc = st.slider(
-                "Top categorías por ingreso perdido",
-                5, 30, 10, key="p3_top_cat"
-            )
+            topc = st.slider("Top categorías por ingreso perdido", 5, 30, 10, key="p3_top_cat")
             chart_bar(
                 ghost_cat.head(topc),
                 "Categoria_clean",
@@ -1445,50 +1451,27 @@ def main() -> None:
 
         if "donut_ingreso_riesgo_fantasma" in analysis_results:
             donut_df = analysis_results["donut_ingreso_riesgo_fantasma"].copy()
-            chart_donut(
-                donut_df,
-                "Tipo",
-                "Valor",
-                "Proporción del ingreso en riesgo por SKU fantasma"
-            )
+            chart_donut(donut_df, "Tipo", "Valor", "Proporción del ingreso en riesgo por SKU fantasma")
 
-
+    # --- Tab 2: Cliente (P2 + P4 + P5)
     with tabs[2]:
         st.subheader("😊 Cliente")
-        if "logistica_vs_nps" in analysis_results:
-            st.markdown("### 2️⃣ Correlación logística vs NPS")
-            corr_df = analysis_results["logistica_vs_nps"]
-            st.dataframe(corr_df.head(100), use_container_width=True)
 
-        if "stock_vs_nps" in analysis_results:
-            st.markdown("### 4️⃣ Stock alto y NPS bajo por categoría")
-            quality_df = analysis_results["stock_vs_nps"]
-            st.dataframe(quality_df, use_container_width=True)
-
-        if "operational_risk" in analysis_results:
-            st.markdown("### 5️⃣ Riesgo operativo por bodega")
-            risk_df = analysis_results["operational_risk"]
-            st.dataframe(risk_df, use_container_width=True)
-                st.markdown("---")
         st.markdown("### 2️⃣ Logística vs NPS — visual")
-
         if "logistica_vs_nps" in analysis_results:
             corr_df = analysis_results["logistica_vs_nps"].copy()
-            # agregar n si no existe
-            if "N" not in corr_df.columns:
-                corr_df["N"] = 1
             chart_scatter(
                 corr_df,
                 x="Tiempo_Entrega_Prom",
                 y="NPS_Prom",
                 color="Bodega_Origen_clean",
-                size=None,
-                title="Tiempo de entrega promedio vs NPS promedio (por ciudad y bodega)",
+                size="N" if "N" in corr_df.columns else None,
+                title="Tiempo de entrega promedio vs NPS promedio (por ciudad y bodega)"
             )
+            st.dataframe(corr_df.sort_values("N", ascending=False).head(100), use_container_width=True)
 
         st.markdown("---")
         st.markdown("### 4️⃣ Stock alto y NPS bajo — cuadrantes")
-
         if "stock_vs_nps_scatter" in analysis_results:
             s = analysis_results["stock_vs_nps_scatter"].copy()
             chart_scatter(
@@ -1497,50 +1480,42 @@ def main() -> None:
                 y="NPS_Prom",
                 color=None,
                 size="N",
-                title="Por categoría: Stock promedio vs NPS promedio (tamaño = n)",
+                title="Por categoría: Stock promedio vs NPS promedio (tamaño = n)"
             )
 
         if "stock_alto_nps_bajo_alerta" in analysis_results:
-            red = analysis_results["stock_alto_nps_bajo_alerta"]
-            st.markdown("**Categorías en alerta: alto stock + NPS bajo (<= 0)**")
+            red = analysis_results["stock_alto_nps_bajo_alerta"].copy()
+            st.markdown("**Categorías en alerta: alto stock (>=Q75) + NPS bajo (<=0)**")
             st.dataframe(red, use_container_width=True)
 
         st.markdown("---")
         st.markdown("### 5️⃣ Riesgo operativo por bodega — (plus: NPS)")
-
         if "riesgo_bodega_plus" in analysis_results:
             r = analysis_results["riesgo_bodega_plus"].copy()
-            # gráfico bar ticket rate
             show = r[["Bodega_Origen_clean", "Ticket_Rate"]].dropna().sort_values("Ticket_Rate", ascending=False)
             chart_bar(show, "Bodega_Origen_clean", "Ticket_Rate", "Ticket rate por bodega (mayor = más riesgo)")
 
-            # scatter días vs ticket rate si existe
             if "Dias_Revision_Prom" in r.columns and r["Dias_Revision_Prom"].notna().any():
                 rr = r.dropna(subset=["Dias_Revision_Prom", "Ticket_Rate"])
                 chart_scatter(rr, "Dias_Revision_Prom", "Ticket_Rate", None, None, "Días desde revisión (prom) vs Ticket rate")
 
-            # NPS por bodega (conexión cliente-operación)
             if "NPS_Prom" in r.columns and r["NPS_Prom"].notna().any():
                 nps_df = r[["Bodega_Origen_clean", "NPS_Prom"]].dropna().sort_values("NPS_Prom")
                 chart_bar(nps_df, "Bodega_Origen_clean", "NPS_Prom", "NPS promedio por bodega (contexto)")
+            st.dataframe(r, use_container_width=True)
 
-
+    # --- Tab 3: IA
     with tabs[3]:
         st.subheader("🧠 Insights IA")
         st.write(
-            "Utiliza IA generativa para obtener recomendaciones. El modelo solo recibe "
-            "estadísticas resumidas (no datos crudos)."
+            "Genera recomendaciones con IA. El modelo recibe **solo estadísticas agregadas** "
+            "(no se envían filas crudas)."
         )
         if st.button("Generar recomendaciones con IA"):
             with st.spinner("Consultando al modelo..."):
                 prompt_messages = build_ai_prompt(joined)
                 ai_result = call_groq(prompt_messages)
-                st.text_area(
-                    "Recomendaciones IA",
-                    value=ai_result,
-                    height=300,
-                    help="Resultado generado por Llama en Groq"
-                )
+                st.text_area("Recomendaciones IA", value=ai_result, height=320)
 
 
 if __name__ == "__main__":
