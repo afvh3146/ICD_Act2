@@ -927,22 +927,22 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
     # ✅ CLAVE: si es fantasma, no hay categoría desde inventario
-    if "Categoria_clean" in ghost.columns:
-        ghost["Categoria_fantasma"] = ghost["Categoria_clean"].fillna("sin categoría (SKU no existe en inventario)")
-        ghost_by_cat = (
-            ghost.groupby("Categoria_fantasma", dropna=False)["Ingreso"]
-            .sum()
-            .reset_index()
-            .rename(columns={"Ingreso": "Ingreso_Perdido"})
-            .sort_values("Ingreso_Perdido", ascending=False)
-        )
-        results["sku_fantasma_por_categoria"] = ghost_by_cat
+       if "Categoria_clean" in ghost.columns:
+           ghost["Categoria_fantasma"] = ghost["Categoria_clean"].fillna("sin categoría (SKU no existe en inventario)")
+           ghost_by_cat = (
+               ghost.groupby("Categoria_fantasma", dropna=False)["Ingreso"]
+               .sum()
+               .reset_index()
+               .rename(columns={"Ingreso": "Ingreso_Perdido"})
+               .sort_values("Ingreso_Perdido", ascending=False)
+           )
+           results["sku_fantasma_por_categoria"] = ghost_by_cat
 
-        donut_df = pd.DataFrame([
-            {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
-            {"Tipo": "Ingreso en riesgo (SKU fantasma)", "Valor": max(lost_ing, 0)},
-        ])
-        results["donut_ingreso_riesgo_fantasma"] = donut_df
+           donut_df = pd.DataFrame([
+               {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
+               {"Tipo": "Ingreso en riesgo (SKU fantasma)", "Valor": max(lost_ing, 0)},
+           ])
+           results["donut_ingreso_riesgo_fantasma"] = donut_df
 
     # -------------------------
     # P4) Stock vs NPS por categoría (cuadrantes)
