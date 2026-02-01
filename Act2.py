@@ -1395,6 +1395,8 @@ def build_ai_prompt_from_analysis(
             "Eres un consultor senior de analítica para retail, inventario y logística. Audiencia: Junta Directiva.\n"
             "Reglas estrictas:\n"
             "- NO expliques código. NO menciones pandas/streamlit/dataset.\n"
+            "- NO pongas solamente datos, explícalos en el contexto del problema.\n"
+            "- Usa los gráficos y tablas para analizar el problema.\n"
             "- Basarte ÚNICAMENTE en la evidencia numérica provista (USD, %, top SKUs, rankings, zonas).\n"
             "- Entregar EXACTAMENTE 3 párrafos.\n"
             "- Cada párrafo debe incluir recomendaciones numeradas y priorizadas por complejidad: (Baja), (Media), (Alta).\n"
@@ -1503,8 +1505,17 @@ P5) Riesgo operativo (revisión vs tickets):
 {p5_txt}
 
 INSTRUCCIÓN DE SALIDA:
-Entrega EXACTAMENTE 3 párrafos.
-En cada párrafo incluye recomendaciones numeradas con complejidad (Baja/Media/Alta).
+Narrativa de Negocio: No explique código; explique por qué la empresa está perdiendo dinero y cómo los datos lo demuestran.
+ruebas Visuales: Incluya al menos 4 capturas de pantalla del Dashboard que soporten sus recomendaciones.
+Entrega EXACTAMENTE la respuesta a las siguientes preguntas: 
+Interrogantes Estratégicos Obligatorios
+1. Fuga de Capital y Rentabilidad: Localice los SKUs que se están vendiendo con margen negativo. ¿Representan una pérdida aceptable por volumen o es una falla crítica de precios en el canal Online?
+2. Crisis Logística y Cuellos de Botella: ¿En qué ciudades y bodegas la correlación entre Tiempo de Entrega y NPS bajo es más fuerte? Identifique la zona que requiere un cambio inmediato de operador.
+3. Análisis de la Venta Invisible: Cuantifique el impacto financiero (en USD) de las ventas cuyos SKUs no están en el maestro de inventario. ¿Qué porcentaje del ingreso total está en riesgo por falta de control de inventario?
+4. DiagnósticodeFidelidad:¿Existencategoríasdeproductosconaltadisponibilidad (stock alto) pero con un sentimiento de cliente negativo? Explique la paradoja: ¿Es mala calidad de producto o sobrecosto?
+5. Storytelling de Riesgo Operativo: Visualice la relación entre la antigüedad de la Última Revisión del stock y la tasa de Tickets de Soporte. ¿Qué bodegas están operando a ciegas y cómo impacta esto en la satisfacción final?.
+Usa las tablas y gráficos para sustentar cada punto
+En cada párrafo incluye recomendaciones numeradas con complejidad (Baja/Media/Alta): Plan de Acción: Tres recomendaciones tácticas numeradas y priorizadas (Baja, Media, Alta complejidad)..
 Conecta recomendaciones con los hallazgos anteriores y referencia evidencia (USD/%, tops, rankings).
 """.strip()
 
