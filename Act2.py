@@ -578,7 +578,7 @@ if "Fecha_Venta" in tx.columns:
     )
 
 
-    # Numeric flags
+        # Numeric flags
     if "Cantidad_Vendida" in tx.columns:
         add_flag("cantidad_no_positiva", tx["Cantidad_Vendida"].notna() & (tx["Cantidad_Vendida"] <= 0))
     if "Tiempo_Entrega_Real" in tx.columns:
@@ -587,6 +587,7 @@ if "Fecha_Venta" in tx.columns:
     if "Costo_Envio" in tx.columns:
         add_flag("costo_nulo", tx["Costo_Envio"].isna())
         add_flag("costo_no_positivo", tx["Costo_Envio"].notna() & (tx["Costo_Envio"] <= 0))
+
     # Unknown flags
     if "Ciudad_Destino_clean" in tx.columns:
         add_flag("ciudad_unknown", (tx["Ciudad_Destino_clean"].astype("string") == "unknown"))
@@ -594,32 +595,15 @@ if "Fecha_Venta" in tx.columns:
         add_flag("estado_unknown", (tx["Estado_Envio_clean"].astype("string") == "unknown"))
     if "Canal_Venta_clean" in tx.columns:
         add_flag("canal_unknown", (tx["Canal_Venta_clean"].astype("string") == "unknown"))
-    # Bring suspicious city flag into list if not already
+
     if "flag__ciudad_sospechosa" in tx.columns and "flag__ciudad_sospechosa" not in flag_cols:
         flag_cols.append("flag__ciudad_sospechosa")
-    # Has any flag indicator
+
     tx["has_any_flag"] = tx[flag_cols].any(axis=1) if flag_cols else False
-    # Future year correction if requested
-    tx["fix__venta_year_2026_to_2025"] = False
-    tx["Fecha_Venta_dt_fixed"] = tx["Fecha_Venta_dt"]
-    if fix_future_year and "Fecha_Venta_dt" in tx.columns:
-        # Replace year 2026 with 2025 only for future dates
-        today = pd.Timestamp.now().normalize()
-        if "flag__venta_futura" in tx.columns:
-            m = (tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"].dt.year == 2026) & (tx["flag__venta_futura"]))
-        else:
-            m = (tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"].dt.year == 2026) & (tx["Fecha_Venta_dt"] > today))
-        def _replace_year(d: pd.Timestamp) -> pd.Timestamp:
-            try:
-                return d.replace(year=2025)
-            except Exception:
-                return d
-        tx.loc[m, "Fecha_Venta_dt_fixed"] = tx.loc[m, "Fecha_Venta_dt"].map(_replace_year)
-        tx.loc[m, "fix__venta_year_2026_to_2025"] = True
-        actions.append(f"Fechas 2026 corregidas a 2025 en {int(m.sum())} filas")
+
     # Rare rows
     tx_rare = tx[tx["has_any_flag"]].copy()
-    # Default exclude none; user decides
+
     default_exclude: set[str] = set()
     tx_final, applied_flags, _ = apply_exclusions_button(
         tx, flag_cols, default_exclude, "Transacciones",
@@ -627,6 +611,7 @@ if "Fecha_Venta" in tx.columns:
     )
     if applied_flags:
         actions.append("Exclusiones aplicadas en transacciones: " + ", ".join(applied_flags))
+
     desc = [
         "Fecha_Venta parseada con dayfirst=True (dd/mm/yyyy).",
         "Normalización de texto + mapeo + fuzzy para Ciudad/Estado/Canal.",
@@ -635,7 +620,9 @@ if "Fecha_Venta" in tx.columns:
         "Opción de corregir año 2026 a 2025 para ventas futuras.",
     ]
     desc.extend(actions)
+
     return df_raw, tx, tx_final, tx_rare, flag_cols, desc
+
 
 
 def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
