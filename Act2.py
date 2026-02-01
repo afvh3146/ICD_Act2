@@ -801,12 +801,43 @@ inv_raw_out, inv_clean, inv_final, inv_rare, inv_flags, inv_text_changes, inv_cl
 tx_raw_out, tx_clean, tx_final, tx_rare, tx_flags, tx_text_changes, tx_cleaned_cols, tx_original_cols, tx_desc = process_transacciones(tx_raw)
 fb_raw_out, fb_clean, fb_final, fb_rare, fb_for_join, fb_flags, fb_text_changes, fb_cleaned_cols, fb_original_cols, fb_desc = process_feedback(fb_raw)
 
-st.sidebar.markdown("### Inventario")
-st.sidebar.markdown("\n".join([f"• {x}" for x in inv_desc]))
-st.sidebar.markdown("### Transacciones")
-st.sidebar.markdown("\n".join([f"• {x}" for x in tx_desc]))
-st.sidebar.markdown("### Feedback")
-st.sidebar.markdown("\n".join([f"• {x}" for x in fb_desc]))
+# =========================
+# Sidebar: resumen de limpieza (desplegable + sub-desplegables)
+# =========================
+st.sidebar.divider()
+
+with st.sidebar.expander("🧾 Cómo estamos limpiando cada base (ver detalles)", expanded=False):
+
+    with st.expander("📦 Inventario — detalle", expanded=False):
+        st.markdown("\n".join([f"• {x}" for x in inv_desc]))
+
+        # opcional: checklist de decisiones tomadas (puedes editar texto)
+        with st.expander("✅ Decisiones / opciones del usuario (Inventario)", expanded=False):
+            st.markdown(
+                "- Stock negativo: opción **abs()** (si el usuario la activa).\n"
+                "- Outliers IQR: vienen **preseleccionados** para excluir (pero solo se excluyen si se aplica).\n"
+                "- Categorías/Bodega: normalización + diccionario + fuzzy (si rapidfuzz)."
+            )
+
+    with st.expander("🚚 Transacciones — detalle", expanded=False):
+        st.markdown("\n".join([f"• {x}" for x in tx_desc]))
+
+        with st.expander("✅ Decisiones / opciones del usuario (Transacciones)", expanded=False):
+            st.markdown(
+                "- Ciudad sospechosa/desconocida: marcar como **unknown** (recomendado).\n"
+                "- Venta futura: opción de corregir **2026 → 2025** (si el usuario la activa).\n"
+                "- Cantidad negativa y tiempo outlier: quedan para **revisión**, no se excluyen por defecto."
+            )
+
+    with st.expander("💬 Feedback — detalle", expanded=False):
+        st.markdown("\n".join([f"• {x}" for x in fb_desc]))
+
+        with st.expander("✅ Decisiones / opciones del usuario (Feedback)", expanded=False):
+            st.markdown(
+                "- Transaccion_ID: se conserva completo (string + strip).\n"
+                "- NPS: redondeo opcional + categoría (muy_negativo/neutral/positivo/excelente).\n"
+                "- Estrategia join: **agregar a 1:1** o mantener **1:N**."
+            )
 
 # =========================
 # UI principal: datasets
