@@ -2,18 +2,15 @@
 Act2.py — Streamlit dashboard for Challenge 02 (Data Cleaning, Integration and DSS)
 ----------------------------------------------------------------------------------
 
-Qué cubre esta versión (corregida y completa):
+Incluye:
 1) Limpieza auditable (inventario, transacciones, feedback) con flags y exclusiones por botón.
 2) Health score (raw vs final) + descarga de reporte JSON.
 3) JOIN reproducible (Tx↔Inv↔Fb) + flags de SKU fantasma y sin feedback.
 4) Feature engineering (Ingreso, Costos, Margen, Días desde revisión).
-5) Visualizaciones alineadas a P1..P5:
-   - P1: Margen negativo → bar por categoría + scatter priorización por SKU
-   - P2: Logística vs NPS → scatter (por ciudad/bodega, tamaño = N)
-   - P3: SKU fantasma → bar por categoría + donut proporción ingreso en riesgo
-   - P4: Stock vs NPS → scatter cuadrantes + tabla alerta (alto stock & NPS bajo)
-   - P5: Riesgo operativo → ticket rate por bodega + (opcional) días vs ticket rate + NPS por bodega
-6) IA opcional (Groq) con prompt basado en estadísticas agregadas (no se mandan filas crudas).
+5) Visualizaciones alineadas a P1..P5.
+6) IA opcional (Groq) con prompt basado SOLO en estadísticas agregadas.
+7) PDF (botón) con narrativa + evidencia visual (gráficas de la app) + plan de acción.
+   - El análisis se muestra en la app exactamente como se imprime.
 """
 
 import os
@@ -41,12 +38,20 @@ try:
 except Exception:
     REQUESTS_AVAILABLE = False
 
-# Optional charting lib (Altair) for better visuals (pie/donut/scatter with tooltips)
+# Optional charting lib (Altair)
 try:
     import altair as alt  # type: ignore
     ALTAIR_AVAILABLE = True
 except Exception:
     ALTAIR_AVAILABLE = False
+
+# Optional: export Altair charts to PNG (for PDF)
+try:
+    import vl_convert as vlc  # type: ignore  # pip: vl-convert-python
+    VLCONVERT_AVAILABLE = True
+except Exception:
+    VLCONVERT_AVAILABLE = False
+
 from io import BytesIO
 from PIL import Image  # type: ignore
 
@@ -69,16 +74,15 @@ UNKNOWN_TOKENS = {
 
 def safe_for_streamlit_df(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure there are no duplicate columns which confuse Streamlit tables."""
+    if df is None:
+        return pd.DataFrame()
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
 
 
 def normalize_text_keep_unknown(x: Any) -> Any:
-    """Normalise text by lowercasing, removing accents and punctuation.
-    Unknown tokens (e.g. '???', 'na', etc.) are mapped to the literal string 'unknown'.
-    Empty strings and actual NA values propagate as NA.
-    """
+    """Normalize text; unknown tokens mapped to 'unknown'."""
     if pd.isna(x):
         return np.nan
     raw = str(x).strip()
@@ -98,12 +102,10 @@ def normalize_text_keep_unknown(x: Any) -> Any:
 
 
 def apply_manual_map(series_norm: pd.Series, manual_map: Dict[str, str]) -> pd.Series:
-    """Replace values in a normalised series according to a manual mapping."""
     return series_norm.map(lambda v: manual_map.get(v, v))
 
 
 def build_canonical_values(series_after_manual: pd.Series) -> List[str]:
-    """Build a sorted list of canonical values for fuzzy matching."""
     vals = series_after_manual.dropna().astype(str)
     vals = vals[vals != "unknown"]
     return sorted(set(vals.tolist()))
@@ -115,7 +117,6 @@ def fuzzy_map_unique(
     threshold: float = 0.92,
     delta: float = 0.03,
 ) -> Tuple[pd.Series, pd.DataFrame]:
-    """Apply fuzzy matching to map values to canonical values."""
     cols = ["from", "to", "score", "applied"]
     if (not RAPIDFUZZ_AVAILABLE) or (len(canonical) == 0):
         return series_vals, pd.DataFrame(columns=cols)
@@ -150,19 +151,16 @@ def fuzzy_map_unique(
 
 
 def to_numeric(series: pd.Series) -> pd.Series:
-    """Convert a series to numeric, coercing errors to NaN."""
     return pd.to_numeric(series, errors="coerce")
 
 
 def iqr_bounds(series: pd.Series, k: float = 1.5) -> Tuple[float, float]:
-    """Compute lower and upper bounds for outlier detection via IQR."""
     q1, q3 = series.quantile(0.25), series.quantile(0.75)
     iqr = q3 - q1
     return q1 - k * iqr, q3 + k * iqr
 
 
 def outlier_flag_iqr(df: pd.DataFrame, col: str, k: float = 1.5) -> pd.Series:
-    """Return a boolean Series marking outliers in ``col`` according to IQR."""
     if col not in df.columns:
         return pd.Series(False, index=df.index)
     s = pd.to_numeric(df[col], errors="coerce")
@@ -180,7 +178,6 @@ def compute_health_metrics(
     final_df: pd.DataFrame,
     flags: List[str],
 ) -> Dict[str, Any]:
-    """Compute a health report summarising issues before and after cleaning."""
     report: Dict[str, Any] = {}
 
     n_raw, n_final = len(raw_df), len(final_df)
@@ -218,8 +215,10 @@ def compute_health_metrics(
     report["health_score_raw"] = round(max(0, score_raw), 2)
     report["health_score_final"] = round(max(0, score_final), 2)
     return report
+
+
 def _wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float) -> float:
-    """Dibuja texto con saltos de línea automáticos. Devuelve el nuevo y."""
+    """Draw wrapped text; returns new y."""
     words = (text or "").split()
     line = ""
     for w in words:
@@ -236,154 +235,312 @@ def _wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float
     return y
 
 
-def generate_findings_pdf(
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _df_top_to_text(df: pd.DataFrame, cols: List[str], n: int = 5) -> str:
+    """Convert a top N table into bullet-like lines (for PDF and prompt)."""
+    if df is None or df.empty:
+        return "No hay datos suficientes."
+    use = [c for c in cols if c in df.columns]
+    if not use:
+        return "No hay columnas suficientes."
+    df2 = df[use].head(n).copy()
+    lines = []
+    for _, r in df2.iterrows():
+        parts = []
+        for c in use:
+            v = r.get(c, "")
+            if isinstance(v, (int, np.integer)):
+                parts.append(f"{c}={int(v)}")
+            elif isinstance(v, (float, np.floating)):
+                parts.append(f"{c}={v:.2f}")
+            else:
+                parts.append(f"{c}={v}")
+        lines.append("- " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# PDF: build charts as PNG (from app logic) + print-ready narrative preview
+# -----------------------------------------------------------------------------
+
+def altair_to_png_bytes(chart: "alt.Chart") -> bytes:
+    if not (ALTAIR_AVAILABLE and VLCONVERT_AVAILABLE):
+        raise RuntimeError("Altair+vl-convert-python requeridos para exportar charts a PNG.")
+    spec = chart.to_dict()
+    return vlc.vegalite_to_png(spec, scale=2)
+
+
+def build_pdf_charts_from_analysis(analysis_results: Dict[str, Any]) -> Dict[str, bytes]:
+    """
+    Construye las evidencias visuales (mínimo 4) desde analysis_results.
+    Retorna dict: titulo -> bytes(PNG)
+    """
+    charts: Dict[str, bytes] = {}
+    if not (ALTAIR_AVAILABLE and VLCONVERT_AVAILABLE):
+        return charts
+
+    # P1: Margen por categoría
+    if isinstance(analysis_results.get("margen_por_categoria"), pd.DataFrame):
+        df = analysis_results["margen_por_categoria"].copy()
+        if not df.empty and {"Categoria_clean", "Margen_Total"}.issubset(df.columns):
+            ch = (
+                alt.Chart(df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Categoria_clean:N", sort="-y", title="Categoría"),
+                    y=alt.Y("Margen_Total:Q", title="Margen total"),
+                    tooltip=["Categoria_clean", "Margen_Total"],
+                )
+                .properties(height=280, title="P1 — Margen total por categoría")
+            )
+            charts["P1 — Margen total por categoría"] = altair_to_png_bytes(ch)
+
+    # P2: Tiempo entrega vs NPS (ciudad/bodega)
+    if isinstance(analysis_results.get("logistica_vs_nps"), pd.DataFrame):
+        df = analysis_results["logistica_vs_nps"].copy()
+        needed = {"Tiempo_Entrega_Prom", "NPS_Prom", "Ciudad_Destino_clean", "Bodega_Origen_clean"}
+        if not df.empty and needed.issubset(df.columns):
+            ch = (
+                alt.Chart(df)
+                .mark_circle(opacity=0.75)
+                .encode(
+                    x=alt.X("Tiempo_Entrega_Prom:Q", title="Tiempo entrega prom"),
+                    y=alt.Y("NPS_Prom:Q", title="NPS prom"),
+                    color=alt.Color("Bodega_Origen_clean:N", title="Bodega"),
+                    size=alt.Size("N:Q", title="n") if "N" in df.columns else alt.value(60),
+                    tooltip=list(df.columns[:25]),
+                )
+                .properties(height=280, title="P2 — Tiempo de entrega vs NPS (ciudad+bodega)")
+            )
+            charts["P2 — Entrega vs NPS"] = altair_to_png_bytes(ch)
+
+    # P3: Donut ingreso en riesgo
+    if isinstance(analysis_results.get("donut_ingreso_riesgo_fantasma"), pd.DataFrame):
+        df = analysis_results["donut_ingreso_riesgo_fantasma"].copy()
+        if not df.empty and {"Tipo", "Valor"}.issubset(df.columns):
+            ch = (
+                alt.Chart(df)
+                .mark_arc(innerRadius=70)
+                .encode(
+                    theta="Valor:Q",
+                    color=alt.Color("Tipo:N", title="Tipo"),
+                    tooltip=["Tipo", "Valor"],
+                )
+                .properties(height=280, title="P3 — Ingreso en riesgo por SKU fantasma")
+            )
+            charts["P3 — Ingreso en riesgo"] = altair_to_png_bytes(ch)
+
+    # P4: Stock vs NPS por categoría
+    if isinstance(analysis_results.get("stock_vs_nps_scatter"), pd.DataFrame):
+        df = analysis_results["stock_vs_nps_scatter"].copy()
+        if not df.empty and {"Stock_Prom", "NPS_Prom"}.issubset(df.columns):
+            ch = (
+                alt.Chart(df)
+                .mark_circle(opacity=0.75)
+                .encode(
+                    x=alt.X("Stock_Prom:Q", title="Stock prom"),
+                    y=alt.Y("NPS_Prom:Q", title="NPS prom"),
+                    size=alt.Size("N:Q", title="n") if "N" in df.columns else alt.value(60),
+                    tooltip=list(df.columns[:25]),
+                )
+                .properties(height=280, title="P4 — Stock alto vs NPS (por categoría)")
+            )
+            charts["P4 — Stock vs NPS"] = altair_to_png_bytes(ch)
+
+    # P5: Ticket rate por bodega
+    if isinstance(analysis_results.get("riesgo_bodega_plus"), pd.DataFrame):
+        df = analysis_results["riesgo_bodega_plus"].copy()
+        if not df.empty and {"Bodega_Origen_clean", "Ticket_Rate"}.issubset(df.columns):
+            df2 = df[["Bodega_Origen_clean", "Ticket_Rate"]].dropna().sort_values("Ticket_Rate", ascending=False)
+            if not df2.empty:
+                ch = (
+                    alt.Chart(df2)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("Bodega_Origen_clean:N", sort="-y", title="Bodega"),
+                        y=alt.Y("Ticket_Rate:Q", title="Ticket rate"),
+                        tooltip=["Bodega_Origen_clean", "Ticket_Rate"],
+                    )
+                    .properties(height=280, title="P5 — Ticket rate por bodega")
+                )
+                charts["P5 — Ticket rate"] = altair_to_png_bytes(ch)
+
+    return charts
+
+
+def build_print_ready_report_text(
+    df_filtered: pd.DataFrame,
     analysis_results: Dict[str, Any],
-    ai_text: str | None,
-    screenshots: List[bytes],
+    ai_text: str,
+) -> str:
+    """
+    Texto que se muestra en la app EXACTAMENTE como se imprime en el PDF.
+    Incluye resumen ejecutivo + respuestas P1..P5 + plan acción (IA o fallback).
+    """
+    d = df_filtered if df_filtered is not None else pd.DataFrame()
+    total_tx = int(len(d)) if not d.empty else 0
+    total_ing = _safe_float(d["Ingreso"].sum(), 0.0) if (not d.empty and "Ingreso" in d.columns) else 0.0
+    total_margen = _safe_float(d["Margen_Bruto"].sum(), 0.0) if (not d.empty and "Margen_Bruto" in d.columns) else 0.0
+
+    # P1
+    p1_counts = "Sin datos."
+    p1_top = "No hay datos suficientes."
+    if isinstance(analysis_results.get("margen_negativo"), pd.DataFrame):
+        mneg = analysis_results["margen_negativo"].copy()
+        p1_counts = f"SKUs con margen total negativo: {len(mneg):,}"
+        p1_top = _df_top_to_text(mneg.sort_values("Margen_Total").head(10), ["SKU_ID", "Margen_Total", "Cantidad_Total", "Ingreso_Total"], n=10)
+
+    # P2
+    p2_top = "No hay datos suficientes."
+    if isinstance(analysis_results.get("logistica_vs_nps"), pd.DataFrame):
+        l = analysis_results["logistica_vs_nps"].copy()
+        if "N" in l.columns:
+            l = l[l["N"] >= 5].copy()
+        if (not l.empty) and {"Tiempo_Entrega_Prom", "NPS_Prom"}.issubset(l.columns):
+            l["score_riesgo"] = (l["Tiempo_Entrega_Prom"].rank(pct=True)) + ((-l["NPS_Prom"]).rank(pct=True))
+            l = l.sort_values("score_riesgo", ascending=False).head(8)
+            p2_top = _df_top_to_text(l, ["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Prom", "NPS_Prom", "N"], n=8)
+
+    # P3
+    p3_summary = "Sin datos."
+    p3_topcat = "No hay datos suficientes."
+    if isinstance(analysis_results.get("sku_fantasma"), dict):
+        sf = analysis_results["sku_fantasma"]
+        p3_summary = (
+            f"Transacciones con SKU fantasma: {int(sf.get('num_transacciones', 0)):,} | "
+            f"Ingreso en riesgo: {float(sf.get('total_perdido', 0.0)):.2f} USD | "
+            f"% ingreso en riesgo: {float(sf.get('porcentaje', 0.0))*100:.2f}%"
+        )
+    if isinstance(analysis_results.get("sku_fantasma_por_categoria"), pd.DataFrame):
+        gc = analysis_results["sku_fantasma_por_categoria"].copy().sort_values("Ingreso_Perdido", ascending=False).head(10)
+        cat_col = "Categoria_fantasma" if "Categoria_fantasma" in gc.columns else ("Categoria_clean" if "Categoria_clean" in gc.columns else None)
+        if cat_col:
+            p3_topcat = _df_top_to_text(gc, [cat_col, "Ingreso_Perdido"], n=10)
+
+    # P4
+    p4_alert = "No hay datos suficientes."
+    if isinstance(analysis_results.get("stock_alto_nps_bajo_alerta"), pd.DataFrame):
+        red = analysis_results["stock_alto_nps_bajo_alerta"].copy()
+        p4_alert = _df_top_to_text(red, ["Categoria_clean", "Stock_Prom", "NPS_Prom", "N"], n=10)
+
+    # P5
+    p5_top = "No hay datos suficientes."
+    if isinstance(analysis_results.get("riesgo_bodega_plus"), pd.DataFrame):
+        r = analysis_results["riesgo_bodega_plus"].copy().sort_values("Ticket_Rate", ascending=False).head(10)
+        p5_top = _df_top_to_text(r, ["Bodega_Origen_clean", "Ticket_Rate", "Tickets_Abiertos", "Total", "Dias_Revision_Prom", "NPS_Prom"], n=10)
+
+    if not ai_text or not ai_text.strip():
+        ai_text = (
+            "1) (Baja) Bloquear ventas con SKU no registrado y auditar integraciones (reduce ingreso en riesgo inmediato).\n"
+            "2) (Media) Recalibrar pricing/promos en canal web para SKUs con margen negativo priorizando impacto por volumen.\n"
+            "3) (Alta) Intervenir operación en zona Ciudad–Bodega crítica: nuevo SLA, cambio de operador y monitoreo NPS."
+        )
+
+    report = f"""
+DOCUMENTO DE HALLAZGOS — VISTA PREVIA (se imprime igual)
+
+Contexto general:
+- Total de transacciones: {total_tx:,}
+- Ingreso total estimado: {total_ing:.2f} USD
+- Margen bruto total estimado: {total_margen:.2f} USD
+
+P1) Fuga de capital y rentabilidad:
+- {p1_counts}
+- Top SKUs con peor margen total:
+{p1_top}
+
+P2) Crisis logística y cuellos de botella:
+- Top combinaciones Ciudad–Bodega con mayor riesgo (tiempo alto + NPS bajo):
+{p2_top}
+
+P3) Análisis de la venta invisible (SKU fantasma):
+- {p3_summary}
+- Top categorías/segmentos asociados a ventas fantasma:
+{p3_topcat}
+
+P4) Diagnóstico de fidelidad (stock alto + NPS bajo):
+- Categorías en alerta (alto stock y NPS <= 0):
+{p4_alert}
+
+P5) Storytelling de riesgo operativo:
+- Ranking bodegas por ticket rate + días desde revisión + NPS:
+{p5_top}
+
+PLAN DE ACCIÓN (3 recomendaciones priorizadas):
+{ai_text.strip()}
+""".strip()
+    return report
+
+
+def generate_findings_pdf_auto(
+    report_text: str,
+    charts_png: Dict[str, bytes],
 ) -> bytes:
     """
-    Genera el PDF de hallazgos con narrativa + 4 imágenes.
-    screenshots: lista de bytes de imágenes (png/jpg) subidas por el usuario.
-    Retorna bytes del PDF.
+    Genera PDF final: texto (igual a vista previa) + mínimo 4 evidencias visuales si están disponibles.
     """
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
-
     margin = 0.8 * inch
-    y = height - margin
 
-    # Portada / Encabezado
-    c.setFont("Helvetica-Bold", 16)
+    # Página 1: texto
+    y = height - margin
+    c.setFont("Helvetica-Bold", 14)
     c.drawString(margin, y, "Documento de Hallazgos — Consultoría (Challenge 02)")
     y -= 0.35 * inch
 
     c.setFont("Helvetica", 10)
-    y = _wrap_text(
-        c,
-        "Este informe resume hallazgos críticos sobre rentabilidad, control de inventario, logística y riesgo operativo. "
-        "La evidencia proviene del dashboard y de estadísticas agregadas tras la limpieza e integración de datos.",
-        margin,
-        y,
-        width - 2 * margin,
-        14,
-    )
-    y -= 0.15 * inch
-
-    # Resumen ejecutivo con evidencia mínima
-    total_ing = 0.0
-    if "donut_ingreso_riesgo_fantasma" in analysis_results and isinstance(analysis_results["donut_ingreso_riesgo_fantasma"], pd.DataFrame):
-        dd = analysis_results["donut_ingreso_riesgo_fantasma"]
-        if "Valor" in dd.columns:
-            total_ing = float(dd["Valor"].sum())
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, "Resumen ejecutivo (evidencia)")
-    y -= 0.25 * inch
-    c.setFont("Helvetica", 10)
-
-    # P1
-    if "margen_negativo" in analysis_results and isinstance(analysis_results["margen_negativo"], pd.DataFrame):
-        mneg = analysis_results["margen_negativo"]
-        bullet = f"• P1 Rentabilidad: se identifican {len(mneg):,} SKUs con margen total negativo (requiere priorización)."
-    else:
-        bullet = "• P1 Rentabilidad: no hay datos suficientes para estimar margen negativo."
-    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
-
-    # P3
-    if "sku_fantasma" in analysis_results and isinstance(analysis_results["sku_fantasma"], dict):
-        sf = analysis_results["sku_fantasma"]
-        usd = float(sf.get("total_perdido", 0.0))
-        pct = float(sf.get("porcentaje", 0.0)) * 100
-        bullet = f"• P3 Venta invisible: ingreso en riesgo por SKU fantasma = {usd:,.2f} USD ({pct:.2f}% del ingreso)."
-    else:
-        bullet = "• P3 Venta invisible: no hay datos suficientes para cuantificar SKU fantasma."
-    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
-
-    # P2
-    if "logistica_vs_nps" in analysis_results and isinstance(analysis_results["logistica_vs_nps"], pd.DataFrame):
-        bullet = "• P2 Logística: se identifican zonas Ciudad–Bodega con tiempos altos y NPS bajo para intervención inmediata."
-    else:
-        bullet = "• P2 Logística: no hay datos suficientes para analizar tiempo de entrega vs NPS."
-    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
-
-    # P4
-    if "stock_alto_nps_bajo_alerta" in analysis_results and isinstance(analysis_results["stock_alto_nps_bajo_alerta"], pd.DataFrame):
-        red = analysis_results["stock_alto_nps_bajo_alerta"]
-        bullet = f"• P4 Fidelidad: categorías en alerta (alto stock + NPS <= 0): {len(red):,}."
-    else:
-        bullet = "• P4 Fidelidad: no hay evidencia suficiente de paradoja stock alto + NPS bajo."
-    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
-
-    # P5
-    if "riesgo_bodega_plus" in analysis_results and isinstance(analysis_results["riesgo_bodega_plus"], pd.DataFrame):
-        bullet = "• P5 Riesgo operativo: ranking de bodegas por ticket rate y antigüedad de revisión (operar a ciegas)."
-    else:
-        bullet = "• P5 Riesgo operativo: no hay datos suficientes de tickets/revisión por bodega."
-    y = _wrap_text(c, bullet, margin, y, width - 2 * margin, 14)
-
-    y -= 0.15 * inch
-
-    # Insertar capturas (mínimo 4 recomendado)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, "Pruebas visuales (capturas del dashboard)")
-    y -= 0.25 * inch
-
-    img_max_w = width - 2 * margin
-    img_max_h = 2.6 * inch
-
-    for i, img_bytes in enumerate(screenshots[:6], start=1):
-        if y < (margin + img_max_h):
+    for block in report_text.split("\n\n"):
+        y = _wrap_text(c, block.strip(), margin, y, width - 2 * margin, 14)
+        y -= 8
+        if y < margin + 60:
             c.showPage()
             y = height - margin
-
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(margin, y, f"Figura {i}")
-        y -= 0.15 * inch
-
-        try:
-            img = Image.open(BytesIO(img_bytes))
-            img_w, img_h = img.size
-            scale = min(img_max_w / img_w, img_max_h / img_h)
-            draw_w, draw_h = img_w * scale, img_h * scale
-
-            c.drawImage(
-                ImageReader(img),
-                margin,
-                y - draw_h,
-                width=draw_w,
-                height=draw_h,
-                preserveAspectRatio=True,
-                mask="auto",
-            )
-            y -= (draw_h + 0.25 * inch)
-        except Exception:
             c.setFont("Helvetica", 10)
-            y = _wrap_text(c, f"[No se pudo renderizar la imagen {i}.]", margin, y, width - 2 * margin, 14)
-            y -= 0.2 * inch
 
-    # Plan de acción (3 recomendaciones)
-    if y < margin + 2.0 * inch:
+    # Páginas de evidencias visuales
+    if charts_png:
         c.showPage()
         y = height - margin
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin, y, "Pruebas visuales (Dashboard)")
+        y -= 0.25 * inch
 
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, "Plan de acción (3 recomendaciones priorizadas)")
-    y -= 0.25 * inch
-    c.setFont("Helvetica", 10)
+        img_max_w = width - 2 * margin
+        img_max_h = 2.7 * inch
 
-    if ai_text and isinstance(ai_text, str) and ai_text.strip():
-        # Usamos la IA como base (ya viene en 3 párrafos con recomendaciones)
-        y = _wrap_text(c, ai_text.strip(), margin, y, width - 2 * margin, 14)
-    else:
-        fallback = (
-            "1) (Baja) Corregir controles de maestro de inventario: bloquear ventas con SKU no registrado y auditar integraciones.\n"
-            "2) (Media) Revisión de pricing y promociones en canal web para SKUs con margen negativo, priorizando impacto por volumen.\n"
-            "3) (Alta) Rediseñar operación logística en la zona crítica (Ciudad–Bodega): cambio de operador / SLA y monitoreo NPS."
-        )
-        y = _wrap_text(c, fallback, margin, y, width - 2 * margin, 14)
+        i = 1
+        for title, png_b in charts_png.items():
+            if y < margin + img_max_h + 40:
+                c.showPage()
+                y = height - margin
 
-    c.showPage()
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(margin, y, f"Figura {i}: {title}")
+            y -= 0.18 * inch
+
+            try:
+                img = Image.open(BytesIO(png_b))
+                img_w, img_h = img.size
+                scale = min(img_max_w / img_w, img_max_h / img_h)
+                draw_w, draw_h = img_w * scale, img_h * scale
+                c.drawImage(ImageReader(img), margin, y - draw_h, width=draw_w, height=draw_h, preserveAspectRatio=True, mask="auto")
+                y -= (draw_h + 0.25 * inch)
+                i += 1
+            except Exception:
+                c.setFont("Helvetica", 10)
+                y = _wrap_text(c, f"[No se pudo renderizar la figura: {title}]", margin, y, width - 2 * margin, 14)
+                y -= 10
+
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
@@ -397,15 +554,15 @@ def chart_bar(df: pd.DataFrame, x: str, y: str, title: str, height: int = 320):
     st.markdown(f"#### {title}")
     if df is None or df.empty or x not in df.columns or y not in df.columns:
         st.info("No hay datos suficientes para este gráfico.")
-        return
+        return None
 
     tmp = df[[x, y]].dropna().copy()
     if tmp.empty:
         st.info("No hay datos suficientes para este gráfico.")
-        return
+        return None
 
     if ALTAIR_AVAILABLE:
-        c = (
+        ch = (
             alt.Chart(tmp)
             .mark_bar()
             .encode(
@@ -415,10 +572,11 @@ def chart_bar(df: pd.DataFrame, x: str, y: str, title: str, height: int = 320):
             )
             .properties(height=height)
         )
-        st.altair_chart(c, use_container_width=True)
+        st.altair_chart(ch, use_container_width=True)
+        return ch
     else:
-        # fallback
         st.bar_chart(tmp.set_index(x)[y])
+        return None
 
 
 def chart_scatter(
@@ -433,12 +591,11 @@ def chart_scatter(
     st.markdown(f"#### {title}")
     if df is None or df.empty or x not in df.columns or y not in df.columns:
         st.info("No hay datos suficientes para este gráfico.")
-        return
+        return None
 
     tmp = df.copy()
     tmp = tmp.replace([np.inf, -np.inf], np.nan)
 
-    # tooltip más amigable (evita 80 columnas)
     tooltip_cols = [c for c in [x, y, color, size] if c and c in tmp.columns]
     for extra in ["Categoria_clean", "Bodega_Origen_clean", "Ciudad_Destino_clean", "SKU_ID"]:
         if extra in tmp.columns and extra not in tooltip_cols:
@@ -455,22 +612,24 @@ def chart_scatter(
         if size and size in tmp.columns:
             enc["size"] = alt.Size(f"{size}:Q", title=size)
 
-        c = alt.Chart(tmp).mark_circle(opacity=0.7).encode(**enc).properties(height=height)
-        st.altair_chart(c, use_container_width=True)
+        ch = alt.Chart(tmp).mark_circle(opacity=0.7).encode(**enc).properties(height=height)
+        st.altair_chart(ch, use_container_width=True)
+        return ch
     else:
         st.scatter_chart(tmp[[x, y]].dropna())
+        return None
 
 
 def chart_donut(df: pd.DataFrame, category_col: str, value_col: str, title: str, height: int = 320):
     st.markdown(f"#### {title}")
     if df is None or df.empty or category_col not in df.columns or value_col not in df.columns:
         st.info("No hay datos suficientes para este gráfico.")
-        return
+        return None
 
     if not ALTAIR_AVAILABLE:
         st.info("Altair no está disponible; mostrando tabla en su lugar.")
         st.dataframe(df, use_container_width=True)
-        return
+        return None
 
     base = alt.Chart(df).encode(
         theta=alt.Theta(f"{value_col}:Q"),
@@ -479,6 +638,7 @@ def chart_donut(df: pd.DataFrame, category_col: str, value_col: str, title: str,
     )
     donut = base.mark_arc(innerRadius=70).properties(height=height)
     st.altair_chart(donut, use_container_width=True)
+    return donut
 
 
 # -----------------------------------------------------------------------------
@@ -487,7 +647,6 @@ def chart_donut(df: pd.DataFrame, category_col: str, value_col: str, title: str,
 
 @st.cache_data(show_spinner=False)
 def load_csv(uploaded_file) -> pd.DataFrame:
-    """Load a CSV from an uploaded file. Caches the result for speed."""
     return pd.read_csv(uploaded_file)
 
 
@@ -498,7 +657,6 @@ def apply_exclusions_button(
     key_prefix: str,
     help_text: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, List[str], bool]:
-    """Interactive sidebar for flag exclusions with an Apply button."""
     state_key = f"{key_prefix}_applied_flags"
     if state_key not in st.session_state:
         st.session_state[state_key] = []
@@ -545,7 +703,6 @@ def apply_exclusions_button(
 def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str]
 ]:
-    """Clean the inventory dataset and compute flags."""
     with cfg_container:
         st.markdown("#### 📦 Inventario — opciones")
         fix_stock_abs = st.checkbox("Stock: convertir negativo a positivo (abs)", value=False, key="inv_fix_abs")
@@ -626,8 +783,8 @@ def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         add_flag("bodega_unknown", (inv["Bodega_Origen_clean"].astype("string") == "unknown"))
 
     inv["has_any_flag"] = inv[flag_cols].any(axis=1) if flag_cols else False
-
     inv["fix__stock_abs_applied"] = False
+
     if fix_stock_abs and "Stock_Actual" in inv.columns:
         m = inv["Stock_Actual"].notna() & (inv["Stock_Actual"] < 0)
         inv.loc[m, "Stock_Actual"] = inv.loc[m, "Stock_Actual"].abs()
@@ -647,7 +804,7 @@ def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     desc = [
         "Normalización de texto (lowercase, sin tildes, limpieza de signos).",
         "Mapeo manual + fuzzy matching en Categoria y Bodega_Origen.",
-        "Conversión numérica y fecha (Ultima_Revision_dt).",
+        "Conversión numérica y fechas.",
         "Flags: nulos, negativos, outliers IQR, unknown.",
         "Opcional: stock negativo → abs().",
         "Exclusiones por botón (outliers preseleccionados).",
@@ -664,7 +821,6 @@ def process_inventario(df_raw: pd.DataFrame, cfg_container) -> Tuple[
 def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str]
 ]:
-    """Clean the transactions dataset and compute flags."""
     with cfg_container:
         st.markdown("#### 🚚 Transacciones — opciones")
         strict_city = st.checkbox("Ciudad desconocida/sospechosa → unknown", value=True, key="tx_strict_city")
@@ -701,7 +857,7 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
         "perdido": "perdido", "pending": "pendiente", "pendiente": "pendiente", "unknown": "unknown",
     }
     CANAL_MAP = {
-        "fisico": "tienda", "físico": "tienda", "fisco": "tienda",
+        "fisico": "tienda", "físico": "tienda",
         "tienda fisica": "tienda", "tienda física": "tienda", "tienda": "tienda",
         "online": "web", "web": "web", "ecommerce": "web", "app": "app", "whatsapp": "whatsapp", "unknown": "unknown",
     }
@@ -818,7 +974,6 @@ def process_transacciones(df_raw: pd.DataFrame, cfg_container) -> Tuple[
 def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str]
 ]:
-    """Clean the feedback dataset and compute flags."""
     with cfg_container:
         st.markdown("#### 💬 Feedback — opciones")
         fb_strategy = st.selectbox(
@@ -999,7 +1154,6 @@ def process_feedback(df_raw: pd.DataFrame, cfg_container) -> Tuple[
 # -----------------------------------------------------------------------------
 
 def build_kpi_cards(df_joined: pd.DataFrame):
-    """Display KPI cards summarising key metrics of the joined dataset."""
     df = df_joined.copy()
     total_tx = int(len(df))
     margin_neg = int(df["Margen_Bruto"].lt(0).sum()) if "Margen_Bruto" in df.columns else 0
@@ -1011,6 +1165,7 @@ def build_kpi_cards(df_joined: pd.DataFrame):
     col2.metric("Margen negativo", f"{margin_neg:,}")
     col3.metric("SKU fantasma", f"{sku_fantasma:,}")
     col4.metric("Sin feedback", f"{sin_feedback:,}")
+
 
 def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
     """Compute summary statistics for P1..P5 + visuals-friendly tables."""
@@ -1081,7 +1236,7 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         results["logistica_vs_nps"] = corr_table
 
     # -------------------------
-    # P3) SKU fantasma (venta invisible)
+    # P3) SKU fantasma
     # -------------------------
     if "flag__sku_no_existe_en_inventario" in d.columns:
         ghost = d[d["flag__sku_no_existe_en_inventario"]].copy()
@@ -1095,7 +1250,6 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
             "porcentaje": float(lost_ing / total_ing) if total_ing != 0 else 0.0,
         }
 
-        # Donut: ingreso normal vs ingreso en riesgo
         donut_df = pd.DataFrame(
             [
                 {"Tipo": "Ingreso normal", "Valor": max(total_ing - lost_ing, 0)},
@@ -1104,16 +1258,14 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         )
         results["donut_ingreso_riesgo_fantasma"] = donut_df
 
-        # Nota clave: si el SKU no existe en inventario, muchas veces NO hay Categoria_clean válida.
-        # Creamos una categoría fallback para poder graficar/analizar.
+        # ✅ FIX tabla vacía: siempre crear una categoría fallback aunque Categoria_clean esté NaN
         if "Categoria_clean" in ghost.columns:
-            ghost["Categoria_fantasma"] = ghost["Categoria_clean"].fillna(
-                "sin categoría (SKU no existe en inventario)"
-            )
+            ghost["Categoria_fantasma"] = ghost["Categoria_clean"].astype("string").fillna("sin categoría (SKU no existe en inventario)")
+            ghost.loc[ghost["Categoria_fantasma"].isin(["<NA>", "nan", "None", ""]), "Categoria_fantasma"] = "sin categoría (SKU no existe en inventario)"
         else:
             ghost["Categoria_fantasma"] = "sin categoría (SKU no existe en inventario)"
 
-        if "Ingreso" in ghost.columns:
+        if "Ingreso" in ghost.columns and not ghost.empty:
             ghost_by_cat = (
                 ghost.groupby("Categoria_fantasma", dropna=False)["Ingreso"]
                 .sum()
@@ -1124,7 +1276,7 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
             results["sku_fantasma_por_categoria"] = ghost_by_cat
 
     # -------------------------
-    # P4) Stock vs NPS por categoría (cuadrantes)
+    # P4) Stock vs NPS por categoría
     # -------------------------
     if (
         "Stock_Actual" in d.columns
@@ -1142,9 +1294,7 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         )
         results["stock_vs_nps_scatter"] = cat_scatter
 
-        # ✅ Umbral coherente: Q75 sobre el MISMO nivel de agregación (Stock_Prom por categoría)
-        stock_thr = float(cat_scatter["Stock_Prom"].quantile(0.75))
-
+        stock_thr = float(cat_scatter["Stock_Prom"].quantile(0.75)) if not cat_scatter.empty else np.nan
         red = cat_scatter[
             (cat_scatter["Stock_Prom"] >= stock_thr) & (cat_scatter["NPS_Prom"] <= 0)
         ].copy()
@@ -1152,7 +1302,7 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
         results["stock_alto_nps_bajo_alerta"] = red
 
     # -------------------------
-    # P5) Riesgo operativo por bodega (ticket rate + NPS)
+    # P5) Riesgo operativo por bodega
     # -------------------------
     if "Bodega_Origen_clean" in d.columns and "Ticket_Soporte_bool" in d.columns:
         b = d.copy()
@@ -1189,26 +1339,17 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 def get_groq_api_key() -> Optional[str]:
-    """
-    Devuelve la GROQ_API_KEY en este orden:
-    1) key pegada en el sidebar (st.session_state)
-    2) st.secrets["GROQ_API_KEY"]
-    3) variable de entorno GROQ_API_KEY
-    """
     k = st.session_state.get("groq_api_key_input")
     if k:
         return k
-
     if hasattr(st, "secrets"):
         k2 = st.secrets.get("GROQ_API_KEY")
         if k2:
             return k2
-
     return os.environ.get("GROQ_API_KEY")
 
 
 def call_groq(messages: List[Dict[str, str]]) -> str:
-    """Call Groq's OpenAI-compatible chat completions endpoint."""
     api_key = get_groq_api_key()
     if not api_key:
         return (
@@ -1226,13 +1367,13 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
         "model": model_id,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": 512,
+        "max_tokens": 650,
         "top_p": 0.9,
         "stream": False,
     }
 
     try:
-        res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+        res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=35)
         if res.status_code != 200:
             return f"Error Groq {res.status_code}: {res.text}"
         data = res.json()
@@ -1240,155 +1381,94 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
     except Exception as e:
         return f"Error al llamar a Groq: {e}"
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if pd.isna(x):
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def _df_top_to_text(df: pd.DataFrame, cols: List[str], n: int = 5) -> str:
-    """Convierte un top N a texto tipo bullet para meterlo al prompt."""
-    if df is None or df.empty:
-        return "No hay datos suficientes."
-    use = [c for c in cols if c in df.columns]
-    if not use:
-        return "No hay columnas suficientes."
-    df2 = df[use].head(n).copy()
-    lines = []
-    for _, r in df2.iterrows():
-        parts = []
-        for c in use:
-            v = r.get(c, "")
-            if isinstance(v, (int, np.integer)):
-                parts.append(f"{c}={int(v)}")
-            elif isinstance(v, (float, np.floating)):
-                parts.append(f"{c}={v:.2f}")
-            else:
-                parts.append(f"{c}={v}")
-        lines.append("- " + ", ".join(parts))
-    return "\n".join(lines)
-
 
 def build_ai_prompt_from_analysis(
     df_filtered: pd.DataFrame,
     analysis_results: Dict[str, Any],
 ) -> List[Dict[str, str]]:
     """
-    Construye un prompt para Groq usando SOLO estadísticas agregadas ya calculadas.
-    df_filtered: el dataframe ya filtrado/limpio (joined) para totales globales básicos.
-    analysis_results: salida de compute_analysis(df_filtered)
+    Prompt SOLO con estadísticas agregadas.
+    Requisito: 3 párrafos, recomendaciones numeradas y con complejidad (Baja/Media/Alta).
+    Debe responder P1..P5 con evidencia.
     """
     messages: List[Dict[str, str]] = []
-
     messages.append({
         "role": "system",
         "content": (
-            "Eres un consultor senior de analítica para retail y logística. "
-            "Tu audiencia es la Junta Directiva. "
-            "NO expliques código, NO menciones pandas/streamlit, NO digas 'según el dataset'. "
-            "Solo habla de impacto financiero, riesgo operativo y decisiones. "
-            "Responde en EXACTAMENTE 3 párrafos. "
-            "En cada párrafo incluye recomendaciones TÁCTICAS numeradas y priorizadas por complejidad "
-            "(Baja, Media, Alta). "
-            "Cada recomendación debe referenciar explícitamente la evidencia (USD, %, tops, rankings) incluida en el resumen."
+            "Eres un consultor senior de analítica para retail, inventario y logística. Audiencia: Junta Directiva.\n"
+            "Reglas estrictas:\n"
+            "- NO expliques código. NO menciones pandas/streamlit/dataset.\n"
+            "- Basarte ÚNICAMENTE en la evidencia numérica provista (USD, %, top SKUs, rankings, zonas).\n"
+            "- Entregar EXACTAMENTE 3 párrafos.\n"
+            "- Cada párrafo debe incluir recomendaciones numeradas y priorizadas por complejidad: (Baja), (Media), (Alta).\n"
+            "- Debes cubrir P1..P5: margen negativo, logística vs NPS, SKU fantasma, stock alto con NPS bajo, revisión vs tickets.\n"
+            "- En cada recomendación referencia explícita a la evidencia: cifras USD/%, o un top/ranking mencionado.\n"
+            "Si faltan datos en algún punto, dilo como riesgo de medición y propone cómo cerrarlo."
         )
     })
 
     d = df_filtered.copy() if df_filtered is not None else pd.DataFrame()
-
-    # Totales generales
     total_tx = int(len(d)) if not d.empty else 0
     total_ing = _safe_float(d["Ingreso"].sum(), 0.0) if (not d.empty and "Ingreso" in d.columns) else 0.0
     total_margen = _safe_float(d["Margen_Bruto"].sum(), 0.0) if (not d.empty and "Margen_Bruto" in d.columns) else 0.0
 
-    # -------------------------
-    # P1 - Margen negativo
-    # -------------------------
+    # P1
+    p1_counts = "Sin datos."
     p1_top_skus_txt = "No hay datos suficientes."
     p1_by_cat_txt = "No hay datos suficientes."
-    p1_counts = ""
-
-    if "margen_negativo" in analysis_results and isinstance(analysis_results["margen_negativo"], pd.DataFrame):
+    if isinstance(analysis_results.get("margen_negativo"), pd.DataFrame):
         mneg = analysis_results["margen_negativo"].copy()
         p1_counts = f"SKUs con margen total negativo: {len(mneg):,}"
-        # top pérdidas (más negativo)
-        mneg = mneg.sort_values("Margen_Total").head(10)
-        p1_top_skus_txt = _df_top_to_text(mneg, ["SKU_ID", "Margen_Total", "Cantidad_Total", "Ingreso_Total"], n=10)
-
-    if "margen_por_categoria" in analysis_results and isinstance(analysis_results["margen_por_categoria"], pd.DataFrame):
+        p1_top_skus_txt = _df_top_to_text(mneg.sort_values("Margen_Total").head(10), ["SKU_ID", "Margen_Total", "Cantidad_Total", "Ingreso_Total"], n=10)
+    if isinstance(analysis_results.get("margen_por_categoria"), pd.DataFrame):
         mc = analysis_results["margen_por_categoria"].copy().sort_values("Margen_Total").head(10)
         p1_by_cat_txt = _df_top_to_text(mc, ["Categoria_clean", "Margen_Total"], n=10)
 
-    # Señal “online” si existe la columna
-    online_hint = ""
+    online_hint = "No hay desglose por canal disponible."
     if not d.empty and "Canal_Venta_clean" in d.columns and "Margen_Bruto" in d.columns:
         online = d[d["Canal_Venta_clean"].astype("string") == "web"].copy()
         if len(online) > 0:
             online_margen = _safe_float(online["Margen_Bruto"].sum(), 0.0)
             online_ing = _safe_float(online["Ingreso"].sum(), 0.0) if "Ingreso" in online.columns else 0.0
-            online_hint = (
-                f"Canal web: transacciones={len(online):,}, ingreso={online_ing:.2f} USD, margen_total={online_margen:.2f} USD."
-            )
+            online_hint = f"Canal web: transacciones={len(online):,}, ingreso={online_ing:.2f} USD, margen_total={online_margen:.2f} USD."
 
-    # -------------------------
-    # P2 - Logística vs NPS
-    # -------------------------
+    # P2
     p2_txt = "No hay datos suficientes."
-    if "logistica_vs_nps" in analysis_results and isinstance(analysis_results["logistica_vs_nps"], pd.DataFrame):
+    if isinstance(analysis_results.get("logistica_vs_nps"), pd.DataFrame):
         l = analysis_results["logistica_vs_nps"].copy()
-        # “peor zona”: NPS más bajo con tiempos altos y soporte (N)
         if "N" in l.columns:
-            l2 = l[l["N"] >= 5].copy()  # soporte mínimo
-        else:
-            l2 = l.copy()
+            l = l[l["N"] >= 5].copy()
+        if not l.empty and {"Tiempo_Entrega_Prom", "NPS_Prom"}.issubset(l.columns):
+            l["score_riesgo"] = (l["Tiempo_Entrega_Prom"].rank(pct=True)) + ((-l["NPS_Prom"]).rank(pct=True))
+            l = l.sort_values("score_riesgo", ascending=False).head(8)
+            p2_txt = _df_top_to_text(l, ["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Prom", "NPS_Prom", "N"], n=8)
 
-        # score simple: tiempo alto + nps bajo
-        if "Tiempo_Entrega_Prom" in l2.columns and "NPS_Prom" in l2.columns:
-            l2["score_riesgo"] = (l2["Tiempo_Entrega_Prom"].rank(pct=True)) + ((-l2["NPS_Prom"]).rank(pct=True))
-            l2 = l2.sort_values("score_riesgo", ascending=False).head(8)
-            p2_txt = _df_top_to_text(
-                l2,
-                ["Ciudad_Destino_clean", "Bodega_Origen_clean", "Tiempo_Entrega_Prom", "NPS_Prom", "N"],
-                n=8
-            )
-
-    # -------------------------
-    # P3 - SKU fantasma
-    # -------------------------
+    # P3
     p3_summary = "No hay datos suficientes."
     p3_top_cat = "No hay datos suficientes."
-    if "sku_fantasma" in analysis_results and isinstance(analysis_results["sku_fantasma"], dict):
+    if isinstance(analysis_results.get("sku_fantasma"), dict):
         sf = analysis_results["sku_fantasma"]
         p3_summary = (
             f"Transacciones con SKU fantasma: {int(sf.get('num_transacciones', 0)):,}. "
             f"Ingreso en riesgo: {float(sf.get('total_perdido', 0.0)):.2f} USD. "
             f"% del ingreso total en riesgo: {float(sf.get('porcentaje', 0.0)) * 100:.2f}%."
         )
-
-    if "sku_fantasma_por_categoria" in analysis_results and isinstance(analysis_results["sku_fantasma_por_categoria"], pd.DataFrame):
+    if isinstance(analysis_results.get("sku_fantasma_por_categoria"), pd.DataFrame):
         gc = analysis_results["sku_fantasma_por_categoria"].copy().sort_values("Ingreso_Perdido", ascending=False).head(10)
-        # Nota: la columna puede llamarse Categoria_fantasma o Categoria_clean, usamos lo que exista
-        cat_col = "Categoria_fantasma" if "Categoria_fantasma" in gc.columns else "Categoria_clean"
-        p3_top_cat = _df_top_to_text(gc, [cat_col, "Ingreso_Perdido"], n=10)
+        cat_col = "Categoria_fantasma" if "Categoria_fantasma" in gc.columns else ("Categoria_clean" if "Categoria_clean" in gc.columns else None)
+        if cat_col:
+            p3_top_cat = _df_top_to_text(gc, [cat_col, "Ingreso_Perdido"], n=10)
 
-    # -------------------------
-    # P4 - Stock alto y NPS bajo
-    # -------------------------
+    # P4
     p4_alert_txt = "No hay datos suficientes."
-    if "stock_alto_nps_bajo_alerta" in analysis_results and isinstance(analysis_results["stock_alto_nps_bajo_alerta"], pd.DataFrame):
+    if isinstance(analysis_results.get("stock_alto_nps_bajo_alerta"), pd.DataFrame):
         red = analysis_results["stock_alto_nps_bajo_alerta"].copy()
         p4_alert_txt = _df_top_to_text(red, ["Categoria_clean", "Stock_Prom", "NPS_Prom", "N"], n=10)
 
-    # -------------------------
-    # P5 - Riesgo operativo por bodega
-    # -------------------------
+    # P5
     p5_txt = "No hay datos suficientes."
-    if "riesgo_bodega_plus" in analysis_results and isinstance(analysis_results["riesgo_bodega_plus"], pd.DataFrame):
-        r = analysis_results["riesgo_bodega_plus"].copy()
-        r = r.sort_values("Ticket_Rate", ascending=False).head(10)
+    if isinstance(analysis_results.get("riesgo_bodega_plus"), pd.DataFrame):
+        r = analysis_results["riesgo_bodega_plus"].copy().sort_values("Ticket_Rate", ascending=False).head(10)
         p5_txt = _df_top_to_text(r, ["Bodega_Origen_clean", "Ticket_Rate", "Tickets_Abiertos", "Total", "Dias_Revision_Prom", "NPS_Prom"], n=10)
 
     user_summary = f"""
@@ -1399,16 +1479,16 @@ Contexto general:
 - Ingreso total estimado: {total_ing:.2f} USD
 - Margen bruto total estimado: {total_margen:.2f} USD
 
-P1) Fuga de capital y rentabilidad (margen negativo):
-- {p1_counts if p1_counts else "Sin conteo disponible."}
+P1) Fuga de capital y rentabilidad:
+- {p1_counts}
 - Top SKUs con peor margen total:
 {p1_top_skus_txt}
 - Categorías con peor margen total:
 {p1_by_cat_txt}
-- Señal por canal (si aplica):
-{online_hint if online_hint else "No hay desglose por canal disponible."}
+- Señal por canal:
+{online_hint}
 
-P2) Crisis logística y cuellos de botella (tiempo entrega vs NPS):
+P2) Crisis logística y cuellos de botella:
 - Top combinaciones Ciudad–Bodega con mayor riesgo (tiempo alto + NPS bajo):
 {p2_txt}
 
@@ -1418,22 +1498,21 @@ P3) Venta invisible (SKU fantasma):
 {p3_top_cat}
 
 P4) Diagnóstico de fidelidad (stock alto + NPS bajo):
-- Categorías en alerta (alto stock y NPS <= 0):
+- Categorías en alerta:
 {p4_alert_txt}
 
-P5) Storytelling de riesgo operativo (revisión vs tickets):
+P5) Riesgo operativo (revisión vs tickets):
 - Ranking bodegas por ticket rate + días desde revisión + NPS:
 {p5_txt}
 
-INSTRUCCIÓN:
-Entrega EXACTAMENTE 3 párrafos. 
-Cada párrafo debe contener recomendaciones numeradas con complejidad (Baja/Media/Alta). 
-Conecta explícitamente recomendaciones con los hallazgos anteriores.
+INSTRUCCIÓN DE SALIDA:
+Entrega EXACTAMENTE 3 párrafos.
+En cada párrafo incluye recomendaciones numeradas con complejidad (Baja/Media/Alta).
+Conecta recomendaciones con los hallazgos anteriores y referencia evidencia (USD/%, tops, rankings).
 """.strip()
 
     messages.append({"role": "user", "content": user_summary})
     return messages
-
 
 
 # -----------------------------------------------------------------------------
@@ -1455,7 +1534,7 @@ def main() -> None:
     uploaded_fb = st.sidebar.file_uploader("3) feedback_clientes_v2.csv", type=["csv"], key="up_fb")
 
     # -------------------------
-    # 🧠 IA (Groq) - Sidebar (antes del return)
+    # 🧠 IA (Groq) - Sidebar
     # -------------------------
     st.sidebar.divider()
     st.sidebar.subheader("🧠 IA (Groq)")
@@ -1512,7 +1591,7 @@ def main() -> None:
                 except Exception as e:
                     st.sidebar.error(f"❌ Excepción: {e}")
 
-    # Si faltan archivos, avisar y salir (pero dejando visible IA en sidebar)
+    # Si faltan archivos, avisar y salir (pero dejando IA visible en sidebar)
     if uploaded_inv is None or uploaded_tx is None or uploaded_fb is None:
         st.info("👈 Sube los 3 archivos para habilitar el JOIN y dejar todo listo para análisis.")
         return
@@ -1567,7 +1646,7 @@ def main() -> None:
             key="join_city_min_support",
         )
 
-    # Documentation expander
+    # Documentation
     with doc_cfg:
         st.markdown("#### 🧾 Cómo estamos limpiando (documentación)")
         with st.expander("📦 Inventario — detalle", expanded=False):
@@ -1581,6 +1660,9 @@ def main() -> None:
     # JOIN
     # -------------------------
     st.header("✅ Dataset final (JOIN) — listo para análisis")
+
+    if "_attach" not in st.session_state:
+        st.session_state["attach"] = {}
 
     if "SKU_ID" not in inv_final.columns:
         st.error("Inventario no tiene SKU_ID.")
@@ -1678,6 +1760,10 @@ def main() -> None:
     # KPI cards + analysis
     build_kpi_cards(joined)
     analysis_results = compute_analysis(joined)
+
+    # Session default for IA text
+    if "ai_last_text" not in st.session_state:
+        st.session_state["ai_last_text"] = ""
 
     # -------------------------
     # Tabs
@@ -1842,7 +1928,7 @@ def main() -> None:
                 x="Stock_Prom",
                 y="NPS_Prom",
                 color=None,
-                size="N",
+                size="N" if "N" in s.columns else None,
                 title="Por categoría: Stock promedio vs NPS promedio (tamaño = n)"
             )
 
@@ -1874,40 +1960,63 @@ def main() -> None:
             "Genera recomendaciones con IA. El modelo recibe **solo estadísticas agregadas** "
             "(no se envían filas crudas)."
         )
-        if st.button("Generar recomendaciones con IA"):
+
+        if st.button("Generar recomendaciones con IA", key="btn_ai"):
             with st.spinner("Consultando al modelo..."):
                 prompt_messages = build_ai_prompt_from_analysis(joined, analysis_results)
                 ai_result = call_groq(prompt_messages)
-                st.text_area("Recomendaciones IA", value=ai_result, height=320)
                 st.session_state["ai_last_text"] = ai_result
 
+        st.text_area("Recomendaciones IA (persisten para el PDF)", value=st.session_state["ai_last_text"], height=320)
 
+        with st.expander("Ver prompt enviado (solo agregados)", expanded=False):
+            try:
+                msgs = build_ai_prompt_from_analysis(joined, analysis_results)
+                st.code(msgs[-1]["content"])
+            except Exception as e:
+                st.error(f"No pude construir el prompt: {e}")
+
+    # --- Tab 4: PDF (AUTO + vista previa)
     with tabs[4]:
-    st.subheader("📄 Documento de Hallazgos (PDF)")
-    st.write("Este PDF es el informe de consultoría para junta directiva. Incluye narrativa, evidencia y plan de acción.")
+        st.subheader("📄 Documento de Hallazgos (PDF)")
+        st.write("Este PDF es el informe de consultoría para junta directiva. Incluye narrativa, evidencia y plan de acción.")
 
-    st.markdown("### 1) Capturas obligatorias del Dashboard (mínimo 4)")
-    uploaded_imgs = st.file_uploader(
-        "Sube 4+ capturas (PNG/JPG) tomadas del dashboard (P1, P2, P3, P5 recomendadas)",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        key="pdf_imgs"
-    )
+        # 1) Vista previa (igual a impresión)
+        report_text = build_print_ready_report_text(
+            df_filtered=joined,
+            analysis_results=analysis_results,
+            ai_text=st.session_state.get("ai_last_text", "")
+        )
 
-    if "ai_last_text" not in st.session_state:
-        st.session_state["ai_last_text"] = ""
+        st.markdown("### Vista previa (se imprime igual)")
+        st.text_area("Contenido del informe", value=report_text, height=420)
 
-    st.markdown("### 2) Generar PDF")
-    if st.button("📄 Generar hallazgos.pdf", key="btn_make_pdf"):
-        if not uploaded_imgs or len(uploaded_imgs) < 4:
-            st.error("Necesitas subir al menos 4 capturas para cumplir el requisito.")
+        # 2) Evidencias visuales (auto desde gráficos)
+        st.markdown("### Evidencia visual (auto desde el dashboard)")
+        if not (ALTAIR_AVAILABLE and VLCONVERT_AVAILABLE):
+            st.warning(
+                "Para incluir gráficas en el PDF necesitas instalar `altair` y `vl-convert-python`. "
+                "El PDF se generará con texto/tablas si no están."
+            )
+            charts_png = {}
         else:
-            img_bytes_list = [f.getvalue() for f in uploaded_imgs]
+            charts_png = build_pdf_charts_from_analysis(analysis_results)
+            st.caption(f"Gráficas listas para PDF: {len(charts_png)} (ideal >= 4).")
+            if charts_png:
+                st.success("✅ Evidencias construidas automáticamente desde analysis_results.")
+            else:
+                st.warning("No pude construir evidencias visuales (revisa que existan P1..P5 en analysis_results).")
 
-            pdf_bytes = generate_findings_pdf(
-                analysis_results=analysis_results,
-                ai_text=st.session_state.get("ai_last_text"),
-                screenshots=img_bytes_list,
+        # 3) Botón PDF
+        st.markdown("### Generar PDF")
+        if st.button("📄 Generar hallazgos.pdf (auto)", key="btn_make_pdf_auto"):
+            # Requisito visual mínimo: intentamos 4; si no, avisamos pero generamos igual (para no bloquear)
+            if len(charts_png) < 4:
+                st.warning(f"Evidencia visual < 4 (solo {len(charts_png)}). Se generará igual con lo disponible.")
+
+            pdf_bytes = generate_findings_pdf_auto(
+                report_text=report_text,
+                charts_png=charts_png
             )
 
             st.success("PDF generado ✅")
@@ -1919,7 +2028,6 @@ def main() -> None:
                 key="dl_pdf"
             )
 
-   
+
 if __name__ == "__main__":
     main()
-    
