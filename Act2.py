@@ -916,25 +916,31 @@ def compute_analysis(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def call_groq(messages: List[Dict[str, str]]) -> str:
-    """Call Groq's LLM API with a chat format.  Returns the assistant content.
+    api_key = None
 
-    This function looks for a key in Streamlit secrets (``GROQ_API_KEY``) or the
-    environment.  If neither is present or the requests library is not
-    available, it returns a message explaining the situation.  The API URL
-    follows Groq's OpenAI‑compatible endpoint.
-    """
-    api_key = st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None
+    # 1) secrets
+    if hasattr(st, "secrets"):
+        api_key = st.secrets.get("GROQ_API_KEY")
+
+    # 2) env var
     if not api_key:
         api_key = os.environ.get("GROQ_API_KEY")
+
+    # 3) sidebar input (sesión)
     if not api_key:
-        return "Error: No se encontró la clave GROQ_API_KEY en st.secrets ni en variables de entorno. Configúrala para usar IA."
+        api_key = st.session_state.get("groq_api_key_input")
+
+    if not api_key:
+        return (
+            "Error: No se encontró la clave GROQ_API_KEY. "
+            "Pégala en el sidebar o configúrala en st.secrets / variables de entorno."
+        )
+
     if not REQUESTS_AVAILABLE:
         return "Error: la librería requests no está disponible en este entorno."
+
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": "llama3-8b-8192",
         "messages": messages,
@@ -943,6 +949,7 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
         "top_p": 0.9,
         "stream": False,
     }
+
     try:
         res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
         res.raise_for_status()
@@ -950,6 +957,7 @@ def call_groq(messages: List[Dict[str, str]]) -> str:
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"Error al llamar a Groq: {e}"
+
 
 
 def build_ai_prompt(df: pd.DataFrame) -> List[Dict[str, str]]:
@@ -1012,6 +1020,37 @@ def main() -> None:
     if uploaded_inv is None or uploaded_tx is None or uploaded_fb is None:
         st.info("👈 Sube los 3 archivos para habilitar el JOIN y dejar todo listo para análisis.")
         return
+        # --------------------------------------------------
+    # 🧠 IA (Groq) — configuración de API Key
+    # --------------------------------------------------
+    st.sidebar.divider()
+    st.sidebar.subheader("🧠 IA (Groq)")
+
+    # 1) Intentar leer desde secrets o env
+    default_key = None
+    if hasattr(st, "secrets"):
+        default_key = st.secrets.get("GROQ_API_KEY")
+    if not default_key:
+        default_key = os.environ.get("GROQ_API_KEY")
+
+    # 2) Si no hay key, permitir que el usuario la pegue (solo sesión)
+    if "groq_api_key_input" not in st.session_state:
+        st.session_state["groq_api_key_input"] = ""
+
+    if not default_key:
+        st.session_state["groq_api_key_input"] = st.sidebar.text_input(
+            "Pega tu GROQ_API_KEY (no se guarda)",
+            type="password",
+            value=st.session_state["groq_api_key_input"],
+            help=(
+                "Se usa solo en esta sesión. "
+                "Para producción, configura st.secrets o variables de entorno."
+            ),
+        )
+        st.sidebar.caption("✅ La clave se usa solo mientras la app está abierta.")
+    else:
+        st.sidebar.success("GROQ_API_KEY detectada en secrets o variables de entorno.")
+
     # Load CSVs
     inv_raw = load_csv(uploaded_inv)
     tx_raw = load_csv(uploaded_tx)
