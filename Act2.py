@@ -1,17 +1,15 @@
-"""
-Act2.py — Streamlit dashboard for Challenge 02 (Data Cleaning, Integration and DSS)
-----------------------------------------------------------------------------------
-
-Incluye:
-1) Limpieza auditable (inventario, transacciones, feedback) con flags y exclusiones por botón.
-2) Health score (raw vs final) + descarga de reporte JSON.
-3) JOIN reproducible (Tx↔Inv↔Fb) + flags de SKU fantasma y sin feedback.
-4) Feature engineering (Ingreso, Costos, Margen, Días desde revisión).
-5) Visualizaciones alineadas a P1..P5.
-6) IA opcional (Groq) con prompt basado SOLO en estadísticas agregadas.
-7) PDF (botón) con narrativa + evidencia visual (gráficas de la app) + plan de acción.
-   - El análisis se muestra en la app exactamente como se imprime.
-"""
+# Act2.py — Streamlit dashboard for Challenge 02 (Data Cleaning, Integration and DSS)
+# ----------------------------------------------------------------------------------
+#
+# Incluye:
+# 1) Limpieza auditable (inventario, transacciones, feedback) con flags y exclusiones por botón.
+# 2) Health score (raw vs final) + descarga de reporte JSON.
+# 3) JOIN reproducible (Tx↔Inv↔Fb) + flags de SKU fantasma y sin feedback.
+# 4) Feature engineering (Ingreso, Costos, Margen, Días desde revisión).
+# 5) Visualizaciones alineadas a P1..P5.
+# 6) IA opcional (Groq) con prompt basado SOLO en estadísticas agregadas.
+# 7) PDF (botón) con narrativa + evidencia visual (gráficas de la app) + plan de acción.
+#    - El análisis se muestra en la app exactamente como se imprime.
 
 import os
 import re
@@ -19,42 +17,41 @@ import unicodedata
 import json
 from datetime import datetime
 from typing import Dict, Tuple, List, Any, Optional
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Try to import rapidfuzz for fuzzy matching; fall back gracefully if not
+# Fuzzy matching (opcional)
 try:
     from rapidfuzz import process, fuzz  # type: ignore
     RAPIDFUZZ_AVAILABLE = True
 except Exception:
     RAPIDFUZZ_AVAILABLE = False
 
-# Try to import requests for optional Groq API call
+# Peticiones a la API Groq (opcional)
 try:
     import requests  # type: ignore
     REQUESTS_AVAILABLE = True
 except Exception:
     REQUESTS_AVAILABLE = False
 
-# Optional charting lib (Altair)
+# Visualizaciones con Altair (opcional)
 try:
     import altair as alt  # type: ignore
     ALTAIR_AVAILABLE = True
 except Exception:
     ALTAIR_AVAILABLE = False
 
-# Optional: export Altair charts to PNG (for PDF)
+# Exportar Altair a PNG (para PDF)
 try:
-    import vl_convert as vlc  # type: ignore  # pip: vl-convert-python
+    import vl_convert as vlc  # type: ignore
     VLCONVERT_AVAILABLE = True
 except Exception:
     VLCONVERT_AVAILABLE = False
 
-from io import BytesIO
-from PIL import Image  # type: ignore
-
+from PIL import Image
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
@@ -1660,9 +1657,6 @@ def main() -> None:
     # JOIN
     # -------------------------
     st.header("✅ Dataset final (JOIN) — listo para análisis")
-
-    if "_attach" not in st.session_state:
-        st.session_state["attach"] = {}
 
     if "SKU_ID" not in inv_final.columns:
         st.error("Inventario no tiene SKU_ID.")
