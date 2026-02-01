@@ -1882,40 +1882,44 @@ def main() -> None:
                 st.session_state["ai_last_text"] = ai_result
 
 
-
-if __name__ == "__main__":
-    main()
     with tabs[4]:
     st.subheader("📄 Documento de Hallazgos (PDF)")
-    st.write("Sube mínimo 4 capturas del dashboard (PNG/JPG). Luego genera el PDF para guardarlo en el repo.")
+    st.write("Este PDF es el informe de consultoría para junta directiva. Incluye narrativa, evidencia y plan de acción.")
 
+    st.markdown("### 1) Capturas obligatorias del Dashboard (mínimo 4)")
     uploaded_imgs = st.file_uploader(
-        "Sube 4+ capturas (PNG/JPG)",
+        "Sube 4+ capturas (PNG/JPG) tomadas del dashboard (P1, P2, P3, P5 recomendadas)",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
         key="pdf_imgs"
     )
 
-    # Guardar último texto IA para PDF (si existe)
     if "ai_last_text" not in st.session_state:
         st.session_state["ai_last_text"] = ""
 
-    st.caption("Tip: Genera primero recomendaciones con IA y luego crea el PDF para incluirlas como Plan de Acción.")
-
-    if st.button("📄 Generar PDF de Hallazgos", key="btn_make_pdf"):
+    st.markdown("### 2) Generar PDF")
+    if st.button("📄 Generar hallazgos.pdf", key="btn_make_pdf"):
         if not uploaded_imgs or len(uploaded_imgs) < 4:
             st.error("Necesitas subir al menos 4 capturas para cumplir el requisito.")
         else:
             img_bytes_list = [f.getvalue() for f in uploaded_imgs]
+
             pdf_bytes = generate_findings_pdf(
                 analysis_results=analysis_results,
                 ai_text=st.session_state.get("ai_last_text"),
                 screenshots=img_bytes_list,
             )
+
+            st.success("PDF generado ✅")
             st.download_button(
                 "⬇️ Descargar hallazgos.pdf",
                 data=pdf_bytes,
                 file_name="hallazgos.pdf",
-                mime="application/pdf"
+                mime="application/pdf",
+                key="dl_pdf"
             )
-  
+
+   
+if __name__ == "__main__":
+    main()
+    
