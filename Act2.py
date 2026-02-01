@@ -604,7 +604,7 @@ if "Fecha_Venta" in tx.columns:
     tx["Fecha_Venta_dt_fixed"] = tx["Fecha_Venta_dt"]
     if fix_future_year and "Fecha_Venta_dt" in tx.columns:
         # Replace year 2026 with 2025 only for future dates
-        today = pd.Timestamp.utcnow().normalize()
+        today = pd.Timestamp.now().normalize()
         if "flag__venta_futura" in tx.columns:
             m = (tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"].dt.year == 2026) & (tx["flag__venta_futura"]))
         else:
