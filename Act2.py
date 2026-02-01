@@ -23,7 +23,11 @@ st.caption("Flags NO eliminan por defecto. Excluyes solo si lo seleccionas y pre
 # =========================
 # Helpers
 # =========================
-UNKNOWN_TOKENS = {"???", "??", "?", "na", "n a", "none", "null", "unknown", "sin categoria", "sincategoria", "sin categoría", "---", "—", "-"}
+UNKNOWN_TOKENS = {
+    "???", "??", "?", "na", "n a", "none", "null", "unknown",
+    "sin categoria", "sincategoria", "sin categoría",
+    "---", "—", "-"
+}
 
 def normalize_text_keep_unknown(x: str) -> str:
     if pd.isna(x):
@@ -111,11 +115,16 @@ def iqr_bounds(series, k=1.5):
 def outlier_flag_iqr(df, col, k=1.5):
     if col not in df.columns:
         return pd.Series(False, index=df.index)
-    s = df[col].dropna()
-    if len(s) < 20:
+
+    s = pd.to_numeric(df[col], errors="coerce")
+    base = s.dropna()
+
+    if len(base) < 20:
         return pd.Series(False, index=df.index)
-    low, high = iqr_bounds(s, k=k)
-    return df[col].notna() & ((df[col] < low) | (df[col] > high))
+
+    low, high = iqr_bounds(base, k=k)
+    mask = s.notna() & ((s < low) | (s > high))
+    return mask.fillna(False)
 
 @st.cache_data(show_spinner=False)
 def load_csv(uploaded_file) -> pd.DataFrame:
@@ -130,18 +139,12 @@ def ordered_clean_view(df: pd.DataFrame, cleaned_cols: list, original_cols: list
     extras = [c for c in df.columns if c not in in_any]
 
     tail = []
-    for c in ["has_any_flag"]:
-        if c in df.columns and c not in flag_cols:
-            tail.append(c)
+    if "has_any_flag" in df.columns and "has_any_flag" not in flag_cols:
+        tail.append("has_any_flag")
 
     return df[cleaned_cols + original_cols + extras + flag_cols + tail]
 
 def apply_exclusions_button(df, flag_cols, default_selected, key_prefix, help_text=None):
-    """
-    - Permite seleccionar flags a excluir (checkboxes)
-    - NO aplica hasta que el usuario presiona botón "Aplicar exclusiones"
-    - Retorna: df_final, selected_flags, applied_boolean
-    """
     st.sidebar.markdown(f"### {key_prefix}: flags para excluir del FINAL")
     if help_text:
         st.sidebar.caption(help_text)
@@ -154,7 +157,6 @@ def apply_exclusions_button(df, flag_cols, default_selected, key_prefix, help_te
 
     applied = st.sidebar.button(f"✅ Aplicar exclusiones — {key_prefix}", key=f"{key_prefix}_apply_btn")
 
-    # Persistir decisión aplicada
     state_key = f"{key_prefix}_applied_flags"
     if state_key not in st.session_state:
         st.session_state[state_key] = []
@@ -245,9 +247,6 @@ st.success(f"Inventario cargado ✅ | {len(inv_raw):,} filas")
 st.success(f"Transacciones cargadas ✅ | {len(tx_raw):,} filas")
 st.success(f"Feedback cargado ✅ | {len(fb_raw):,} filas")
 
-# =========================
-# Sidebar: explicación explícita (bullets)
-# =========================
 st.sidebar.divider()
 st.sidebar.header("🧾 Cómo estamos limpiando cada base")
 
@@ -256,12 +255,10 @@ st.sidebar.header("🧾 Cómo estamos limpiando cada base")
 # =========================
 def process_inventario(df_raw: pd.DataFrame):
     st.sidebar.subheader("Inventario — reglas")
-
     fix_stock_abs = st.sidebar.checkbox("Stock: convertir negativo a positivo (abs) — opcional", value=False, key="inv_fix_abs")
 
     inv = df_raw.copy()
 
-    # Originales para vista
     if "Categoria" in inv.columns:
         inv["Categoria_original"] = inv["Categoria"].astype("string")
     if "Bodega_Origen" in inv.columns:
@@ -284,7 +281,6 @@ def process_inventario(df_raw: pd.DataFrame):
     cat_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
     bod_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
 
-    # Normalización texto (automática)
     if "Categoria" in inv.columns:
         inv["Categoria_clean"] = inv["Categoria"].apply(normalize_text_keep_unknown)
         inv["Categoria_clean"] = apply_manual_map(inv["Categoria_clean"], CATEGORY_MAP)
@@ -297,18 +293,20 @@ def process_inventario(df_raw: pd.DataFrame):
         canonical = build_canonical_values(inv["Bodega_Origen_clean"])
         inv["Bodega_Origen_clean"], bod_fuzzy = fuzzy_map_unique(inv["Bodega_Origen_clean"], canonical, 0.92, 0.03)
 
-    # Tipos
     for c in ["Stock_Actual", "Costo_Unitario_USD", "Lead_Time_Dias", "Punto_Reorden"]:
         if c in inv.columns:
             inv[c] = to_numeric(inv[c])
+
     if "Ultima_Revision" in inv.columns:
         inv["Ultima_Revision"] = pd.to_datetime(inv["Ultima_Revision"], errors="coerce")
 
-    # Flags (no eliminan)
     flag_cols = []
+
     def add_flag(name, mask):
         cname = f"flag__{name}"
-        inv[cname] = mask.astype(bool)
+        if not isinstance(mask, pd.Series):
+            mask = pd.Series(mask, index=inv.index)
+        inv[cname] = mask.fillna(False).astype(bool)
         flag_cols.append(cname)
 
     if "SKU_ID" in inv.columns:
@@ -330,29 +328,25 @@ def process_inventario(df_raw: pd.DataFrame):
 
     if "Categoria_clean" in inv.columns:
         add_flag("categoria_nula", inv["Categoria_clean"].isna())
-        add_flag("categoria_unknown", inv["Categoria_clean"].astype("string") == "unknown")
+        add_flag("categoria_unknown", (inv["Categoria_clean"].astype("string") == "unknown").fillna(False))
 
     if "Bodega_Origen_clean" in inv.columns:
         add_flag("bodega_nula", inv["Bodega_Origen_clean"].isna())
-        add_flag("bodega_unknown", inv["Bodega_Origen_clean"].astype("string") == "unknown")
+        add_flag("bodega_unknown", (inv["Bodega_Origen_clean"].astype("string") == "unknown").fillna(False))
 
     inv["has_any_flag"] = inv[flag_cols].any(axis=1) if flag_cols else False
 
-    # Corrección opcional: stock abs
     if fix_stock_abs and "Stock_Actual" in inv.columns:
-        mask = inv["Stock_Actual"].notna() & (inv["Stock_Actual"] < 0)
-        inv.loc[mask, "Stock_Actual"] = inv.loc[mask, "Stock_Actual"].abs()
-        inv["fix__stock_abs_applied"] = mask.astype(bool)
+        m = inv["Stock_Actual"].notna() & (inv["Stock_Actual"] < 0)
+        inv.loc[m, "Stock_Actual"] = inv.loc[m, "Stock_Actual"].abs()
+        inv["fix__stock_abs_applied"] = m.fillna(False).astype(bool)
     else:
         inv["fix__stock_abs_applied"] = False
 
-    # Dataset raros
     inv_rare = inv[inv["has_any_flag"]].copy()
 
-    # Defaults: outliers "salen" (preseleccionados para excluir)
     default_exclude = {"flag__costo_outlier_iqr", "flag__leadtime_outlier_iqr"}
-
-    inv_final, applied_flags, applied_clicked = apply_exclusions_button(
+    inv_final, _, _ = apply_exclusions_button(
         inv, flag_cols, default_exclude, "Inventario",
         help_text="Por defecto: outliers IQR están preseleccionados para excluir (pero NO se aplica hasta que presionas el botón)."
     )
@@ -367,17 +361,16 @@ def process_inventario(df_raw: pd.DataFrame):
         "Categoria": (inv.get("Categoria_original"), inv.get("Categoria_clean"), cat_fuzzy),
         "Bodega_Origen": (inv.get("Bodega_Origen_original"), inv.get("Bodega_Origen_clean"), bod_fuzzy),
     }
-
     desc = [
-        "• Normalización texto automática (trim/lower/sin tildes/guiones→espacio/colapsa espacios).",
-        "• Diccionario + fuzzy (0.92, match único) en Categoria y Bodega_Origen (si rapidfuzz).",
-        "• Tipificación numérica (Stock/Costo/Lead/Punto) y fecha (Ultima_Revision).",
-        "• Flags se calculan y se muestran; NO eliminan por defecto.",
-        "• Stock: opción de abs() si negativo (checkbox).",
-        "• Outliers IQR (k=1.5): se marcan con flag y vienen preseleccionados para excluir (pero solo al aplicar).",
+        "Normalización texto automática (trim/lower/sin tildes/guiones→espacio/colapsa espacios).",
+        "Diccionario + fuzzy (0.92, match único) en Categoria y Bodega_Origen (si rapidfuzz).",
+        "Tipificación numérica (Stock/Costo/Lead/Punto) y fecha (Ultima_Revision).",
+        "Flags se calculan y se muestran; NO eliminan por defecto.",
+        "Stock: opción de abs() si negativo (checkbox).",
+        "Outliers IQR (k=1.5): se marcan con flag y vienen preseleccionados para excluir (pero solo al aplicar).",
     ]
 
-    return inv_raw, inv, inv_final, inv_rare, flag_cols, text_changes, cleaned_cols, original_cols, desc
+    return df_raw, inv, inv_final, inv_rare, flag_cols, text_changes, cleaned_cols, original_cols, desc
 
 # =========================
 # TRANSACCIONES
@@ -390,7 +383,6 @@ def process_transacciones(df_raw: pd.DataFrame):
         value=True,
         key="tx_strict_city"
     )
-
     fix_future_year = st.sidebar.checkbox(
         "Venta futura: si año==2026 → cambiar a 2025 (checkbox de corrección)",
         value=False,
@@ -399,23 +391,19 @@ def process_transacciones(df_raw: pd.DataFrame):
 
     tx = df_raw.copy()
 
-    # Originales
     for c in ["Ciudad_Destino", "Estado_Envio", "Canal_Venta"]:
         if c in tx.columns:
             tx[f"{c}_original"] = tx[c].astype("string")
 
-    # Tipos numéricos
     for c in ["Cantidad_Vendida", "Precio_Venta_Final", "Costo_Envio", "Tiempo_Entrega_Real"]:
         if c in tx.columns:
             tx[c] = to_numeric(tx[c])
 
-    # Fecha (dd/mm/yyyy)
     if "Fecha_Venta" in tx.columns:
         tx["Fecha_Venta_dt"] = pd.to_datetime(tx["Fecha_Venta"], errors="coerce", dayfirst=True)
     else:
         tx["Fecha_Venta_dt"] = pd.NaT
 
-    # Normalización texto
     CITY_MAP = {
         "bog": "bogota", "bogota": "bogota",
         "med": "medellin", "mde": "medellin", "medellin": "medellin",
@@ -450,7 +438,6 @@ def process_transacciones(df_raw: pd.DataFrame):
     tx_status_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
     tx_canal_fuzzy = pd.DataFrame(columns=["from", "to", "score", "applied"])
 
-    # Ciudad
     if "Ciudad_Destino" in tx.columns:
         tx["Ciudad_Destino_norm"] = tx["Ciudad_Destino"].apply(normalize_text_keep_unknown)
 
@@ -460,7 +447,7 @@ def process_transacciones(df_raw: pd.DataFrame):
             parts = set(str(v).split())
             return len(parts.intersection(SUSPICIOUS_CITY_TOKENS)) > 0
 
-        tx["flag__ciudad_sospechosa"] = tx["Ciudad_Destino_norm"].map(_is_city_suspicious).astype(bool)
+        tx["flag__ciudad_sospechosa"] = tx["Ciudad_Destino_norm"].map(_is_city_suspicious).fillna(False).astype(bool)
         if strict_city:
             tx.loc[tx["flag__ciudad_sospechosa"], "Ciudad_Destino_norm"] = "unknown"
 
@@ -468,14 +455,12 @@ def process_transacciones(df_raw: pd.DataFrame):
         canonical = build_canonical_values(tx["Ciudad_Destino_clean"])
         tx["Ciudad_Destino_clean"], tx_city_fuzzy = fuzzy_map_unique(tx["Ciudad_Destino_clean"], canonical, 0.92, 0.03)
 
-    # Estado
     if "Estado_Envio" in tx.columns:
         tx["Estado_Envio_clean"] = tx["Estado_Envio"].apply(normalize_text_keep_unknown)
         tx["Estado_Envio_clean"] = apply_manual_map(tx["Estado_Envio_clean"], STATUS_MAP)
         canonical = build_canonical_values(tx["Estado_Envio_clean"])
         tx["Estado_Envio_clean"], tx_status_fuzzy = fuzzy_map_unique(tx["Estado_Envio_clean"], canonical, 0.92, 0.03)
 
-    # Canal
     if "Canal_Venta" in tx.columns:
         tx["Canal_Venta_clean"] = tx["Canal_Venta"].apply(normalize_text_keep_unknown)
         norm_map = {normalize_text_keep_unknown(k): v for k, v in CANAL_MAP.items()}
@@ -484,25 +469,18 @@ def process_transacciones(df_raw: pd.DataFrame):
         canonical = build_canonical_values(tx["Canal_Venta_clean"])
         tx["Canal_Venta_clean"], tx_canal_fuzzy = fuzzy_map_unique(tx["Canal_Venta_clean"], canonical, 0.92, 0.03)
 
-    # Flags
     flag_cols = []
+
     def add_flag(name, mask):
-    cname = f"flag__{name}"
-    if cname in tx.columns:
-        if cname not in flag_cols:
-            flag_cols.append(cname)
-        return
-
-    # 🔒 robusto: convertir NA -> False antes de castear
-    if isinstance(mask, pd.Series):
-        mask = mask.fillna(False)
-    else:
-        # si por alguna razón llega escalar
-        mask = pd.Series(bool(mask), index=tx.index)
-
-    tx[cname] = mask.astype(bool)
-    flag_cols.append(cname)
-
+        cname = f"flag__{name}"
+        if cname in tx.columns:
+            if cname not in flag_cols:
+                flag_cols.append(cname)
+            return
+        if not isinstance(mask, pd.Series):
+            mask = pd.Series(mask, index=tx.index)
+        tx[cname] = mask.fillna(False).astype(bool)
+        flag_cols.append(cname)
 
     if "Transaccion_ID" in tx.columns:
         add_flag("transaccion_id_nulo", tx["Transaccion_ID"].isna())
@@ -527,38 +505,44 @@ def process_transacciones(df_raw: pd.DataFrame):
         add_flag("costo_no_positivo", tx["Costo_Envio"].notna() & (tx["Costo_Envio"] <= 0))
 
     if "Ciudad_Destino_clean" in tx.columns:
-        add_flag("ciudad_unknown", tx["Ciudad_Destino_clean"].astype("string") == "unknown")
+        add_flag("ciudad_unknown", (tx["Ciudad_Destino_clean"].astype("string") == "unknown").fillna(False))
     if "Estado_Envio_clean" in tx.columns:
-        add_flag("estado_unknown", tx["Estado_Envio_clean"].astype("string") == "unknown")
+        add_flag("estado_unknown", (tx["Estado_Envio_clean"].astype("string") == "unknown").fillna(False))
     if "Canal_Venta_clean" in tx.columns:
-        add_flag("canal_unknown", tx["Canal_Venta_clean"].astype("string") == "unknown")
+        add_flag("canal_unknown", (tx["Canal_Venta_clean"].astype("string") == "unknown").fillna(False))
 
     if "flag__ciudad_sospechosa" in tx.columns and "flag__ciudad_sospechosa" not in flag_cols:
         flag_cols.append("flag__ciudad_sospechosa")
 
     tx["has_any_flag"] = tx[flag_cols].any(axis=1) if flag_cols else False
 
-    # Corrección opcional: venta futura 2026 -> 2025 (solo si está marcada como futura)
     tx["fix__venta_year_2026_to_2025"] = False
     tx["Fecha_Venta_dt_fixed"] = tx["Fecha_Venta_dt"]
 
     if fix_future_year and "Fecha_Venta_dt" in tx.columns:
-        mask = tx["Fecha_Venta_dt"].notna() & (tx["Fecha_Venta_dt"].dt.year == 2026) & (tx["flag__venta_futura"] == True)
+        today = pd.Timestamp.today().normalize()
+        if "flag__venta_futura" in tx.columns:
+            m = (tx["Fecha_Venta_dt"].notna() &
+                 (tx["Fecha_Venta_dt"].dt.year == 2026) &
+                 (tx["flag__venta_futura"] == True))
+        else:
+            m = (tx["Fecha_Venta_dt"].notna() &
+                 (tx["Fecha_Venta_dt"].dt.year == 2026) &
+                 (tx["Fecha_Venta_dt"] > today))
+
         def _replace_year(d):
             try:
                 return d.replace(year=2025)
             except Exception:
                 return d
-        tx.loc[mask, "Fecha_Venta_dt_fixed"] = tx.loc[mask, "Fecha_Venta_dt"].map(_replace_year)
-        tx.loc[mask, "fix__venta_year_2026_to_2025"] = True
 
-    # Dataset raros
+        tx.loc[m, "Fecha_Venta_dt_fixed"] = tx.loc[m, "Fecha_Venta_dt"].map(_replace_year)
+        tx.loc[m, "fix__venta_year_2026_to_2025"] = True
+
     tx_rare = tx[tx["has_any_flag"]].copy()
 
-    # Defaults: NO excluir por defecto cantidad negativa ni tiempo outlier (solo revisión del cliente)
     default_exclude = set()
-
-    tx_final, applied_flags, applied_clicked = apply_exclusions_button(
+    tx_final, _, _ = apply_exclusions_button(
         tx, flag_cols, default_exclude, "Transacciones",
         help_text="Cantidad negativa y tiempo outlier quedan para revisión (no se excluyen por defecto)."
     )
@@ -575,14 +559,13 @@ def process_transacciones(df_raw: pd.DataFrame):
         "Estado_Envio": (tx.get("Estado_Envio_original"), tx.get("Estado_Envio_clean"), tx_status_fuzzy),
         "Canal_Venta": (tx.get("Canal_Venta_original"), tx.get("Canal_Venta_clean"), tx_canal_fuzzy),
     }
-
     desc = [
-        "• Fecha_Venta se parsea con dayfirst=True (dd/mm/yyyy).",
-        "• Normalización texto + diccionario + fuzzy (0.92, match único) para Ciudad/Estado/Canal.",
-        "• Ciudad sospechosa (parece canal) puede forzarse a unknown (checkbox).",
-        "• Se calculan flags; NO eliminan por defecto.",
-        "• Venta futura: opción de corregir año 2026→2025 (checkbox), queda trazado en fix__venta_year_2026_to_2025.",
-        "• Cantidad negativa y tiempo outlier se dejan para revisión (flags).",
+        "Fecha_Venta se parsea con dayfirst=True (dd/mm/yyyy).",
+        "Normalización texto + diccionario + fuzzy (0.92, match único) para Ciudad/Estado/Canal.",
+        "Ciudad sospechosa (parece canal) puede forzarse a unknown (checkbox).",
+        "Se calculan flags; NO eliminan por defecto.",
+        "Venta futura: opción de corregir año 2026→2025 (checkbox), queda trazado en fix__venta_year_2026_to_2025.",
+        "Cantidad negativa y tiempo outlier se dejan para revisión (flags).",
     ]
 
     return df_raw, tx, tx_final, tx_rare, flag_cols, text_changes, cleaned_cols, original_cols, desc
@@ -593,7 +576,6 @@ def process_transacciones(df_raw: pd.DataFrame):
 def process_feedback(df_raw: pd.DataFrame):
     st.sidebar.subheader("Feedback — reglas")
 
-    # Estrategia join
     fb_strategy = st.sidebar.selectbox(
         "Estrategia feedback para JOIN por Transaccion_ID",
         ["Agregar por Transaccion_ID (recomendado 1:1)", "Mantener 1:N"],
@@ -606,14 +588,12 @@ def process_feedback(df_raw: pd.DataFrame):
 
     fb = df_raw.copy()
 
-    # IMPORTANTÍSIMO: Transaccion_ID como string completo (sin normalizar agresivo)
     if "Transaccion_ID" in fb.columns:
         fb["Transaccion_ID_original"] = fb["Transaccion_ID"].astype("string")
         fb["Transaccion_ID_clean"] = fb["Transaccion_ID"].astype("string").str.strip()
     else:
-        fb["Transaccion_ID_clean"] = pd.Series([np.nan] * len(fb))
+        fb["Transaccion_ID_clean"] = pd.Series([np.nan] * len(fb), index=fb.index)
 
-    # Guardar originales texto (si existen)
     if "Comentario_Texto" in fb.columns:
         fb["Comentario_Texto_original"] = fb["Comentario_Texto"].astype("string")
     if "Recomienda_Marca" in fb.columns:
@@ -621,18 +601,15 @@ def process_feedback(df_raw: pd.DataFrame):
     if "Ticket_Soporte_Abierto" in fb.columns:
         fb["Ticket_Soporte_original"] = fb["Ticket_Soporte_Abierto"].astype("string")
 
-    # Tipos numéricos
     for c in ["Rating_Producto", "Rating_Logistica", "Satisfaccion_NPS", "Edad_Cliente"]:
         if c in fb.columns:
             fb[c] = to_numeric(fb[c])
 
-    # Comentario clean
     if "Comentario_Texto" in fb.columns:
         fb["Comentario_Texto_clean"] = fb["Comentario_Texto"].astype("string").str.strip()
         if fb_placeholder_comment:
             fb.loc[fb["Comentario_Texto_clean"].isin(["---", "—", "-", ""]), "Comentario_Texto_clean"] = np.nan
 
-    # Recomienda clean
     if "Recomienda_Marca" in fb.columns:
         norm = fb["Recomienda_Marca"].apply(normalize_text_keep_unknown)
         REC_MAP = {
@@ -643,9 +620,9 @@ def process_feedback(df_raw: pd.DataFrame):
         }
         fb["Recomienda_Marca_clean"] = norm.map(lambda v: REC_MAP.get(v, v)).fillna("unknown")
 
-    # Ticket soporte bool
     if "Ticket_Soporte_Abierto" in fb.columns:
         tnorm = fb["Ticket_Soporte_Abierto"].apply(normalize_text_keep_unknown)
+
         def _to_bool(v):
             if pd.isna(v) or v == "unknown":
                 return np.nan
@@ -654,21 +631,16 @@ def process_feedback(df_raw: pd.DataFrame):
             if v in {"0", "no", "false"}:
                 return False
             return np.nan
+
         fb["Ticket_Soporte_bool"] = tnorm.map(_to_bool)
 
-    # NPS: redondeo opcional
     if "Satisfaccion_NPS" in fb.columns:
         if fb_round_nps:
-            fb["flag__nps_no_entero"] = fb["Satisfaccion_NPS"].notna() & (fb["Satisfaccion_NPS"] % 1 != 0)
+            fb["flag__nps_no_entero"] = (fb["Satisfaccion_NPS"].notna() & (fb["Satisfaccion_NPS"] % 1 != 0)).fillna(False)
             fb["Satisfaccion_NPS"] = fb["Satisfaccion_NPS"].round(0)
         else:
             fb["flag__nps_no_entero"] = False
 
-        # NPS categoría pedida (4 niveles)
-        # muy negativo: [-100, -1]
-        # neutral: 0
-        # positivo: [1, 80]
-        # excelente: [81, 100]
         def nps_bucket(v):
             if pd.isna(v):
                 return np.nan
@@ -684,14 +656,16 @@ def process_feedback(df_raw: pd.DataFrame):
 
         fb["NPS_categoria"] = fb["Satisfaccion_NPS"].map(nps_bucket).astype("string")
 
-    # Flags
     flag_cols = []
+
     def add_flag(name, mask):
         cname = f"flag__{name}"
         if cname in fb.columns and cname not in flag_cols:
             flag_cols.append(cname)
             return
-        fb[cname] = mask.astype(bool)
+        if not isinstance(mask, pd.Series):
+            mask = pd.Series(mask, index=fb.index)
+        fb[cname] = mask.fillna(False).astype(bool)
         flag_cols.append(cname)
 
     add_flag("transaccion_id_nulo", fb["Transaccion_ID_clean"].isna() | (fb["Transaccion_ID_clean"].astype("string").str.len() == 0))
@@ -707,9 +681,12 @@ def process_feedback(df_raw: pd.DataFrame):
         add_flag("rating_logistica_fuera_rango", fb["Rating_Logistica"].notna() & ((fb["Rating_Logistica"] < 1) | (fb["Rating_Logistica"] > 5)))
 
     if "Satisfaccion_NPS" in fb.columns:
-        add_flag("nps_fuera_rango", fb["Satisfaccion_NPS"].notna() & ((fb["Satisfaccion_NPS"] < -100) | (fb["Satisfaccion_NPS"] > 100))
-                )
-        add_flag("nps_categoria_fuera_rango", fb["NPS_categoria"].astype("string") == "fuera_rango")
+        add_flag(
+            "nps_fuera_rango",
+            fb["Satisfaccion_NPS"].notna()
+            & ((fb["Satisfaccion_NPS"] < -100) | (fb["Satisfaccion_NPS"] > 100))
+        )
+        add_flag("nps_categoria_fuera_rango", (fb["NPS_categoria"].astype("string") == "fuera_rango").fillna(False))
 
     if "Comentario_Texto_clean" in fb.columns:
         add_flag("comentario_faltante", fb["Comentario_Texto_clean"].isna())
@@ -722,16 +699,14 @@ def process_feedback(df_raw: pd.DataFrame):
         add_flag("ticket_invalido", fb["Ticket_Soporte_Abierto"].notna() & fb["Ticket_Soporte_bool"].isna())
 
     fb["has_any_flag"] = fb[flag_cols].any(axis=1) if flag_cols else False
-
     fb_rare = fb[fb["has_any_flag"]].copy()
 
-    default_exclude = set()  # no excluir por defecto
-    fb_final, applied_flags, applied_clicked = apply_exclusions_button(
+    default_exclude = set()
+    fb_final, _, _ = apply_exclusions_button(
         fb, flag_cols, default_exclude, "Feedback",
         help_text="Transaccion_ID se preserva completo. No excluimos nada por defecto."
     )
 
-    # Feedback listo para join
     fb_for_join = fb_final.copy()
     fb_for_join["Transaccion_ID_clean"] = fb_for_join["Transaccion_ID_clean"].astype("string").str.strip()
 
@@ -740,12 +715,13 @@ def process_feedback(df_raw: pd.DataFrame):
         for c in ["Rating_Producto", "Rating_Logistica", "Satisfaccion_NPS", "Edad_Cliente"]:
             if c in fb_for_join.columns:
                 agg[c] = "mean"
+
         if "NPS_categoria" in fb_for_join.columns:
-            # moda de categoría (si hay)
             def mode_cat(x):
                 x = x.dropna()
                 return x.mode().iloc[0] if len(x) else np.nan
             agg["NPS_categoria"] = mode_cat
+
         if "Recomienda_Marca_clean" in fb_for_join.columns:
             def mode_or_unknown(x):
                 x = x.dropna()
@@ -756,8 +732,10 @@ def process_feedback(df_raw: pd.DataFrame):
                     return x2.mode().iloc[0]
                 return x.mode().iloc[0]
             agg["Recomienda_Marca_clean"] = mode_or_unknown
+
         if "Ticket_Soporte_bool" in fb_for_join.columns:
             agg["Ticket_Soporte_bool"] = lambda x: bool((x == True).any())
+
         if "Comentario_Texto_clean" in fb_for_join.columns:
             fb_for_join["Comentario_no_nulo"] = fb_for_join["Comentario_Texto_clean"]
             agg["Comentario_no_nulo"] = lambda x: int(x.notna().sum())
@@ -777,13 +755,12 @@ def process_feedback(df_raw: pd.DataFrame):
         "Comentario_Texto": (fb.get("Comentario_Texto_original"), fb.get("Comentario_Texto_clean"), pd.DataFrame()),
         "Transaccion_ID": (fb.get("Transaccion_ID_original"), fb.get("Transaccion_ID_clean"), pd.DataFrame()),
     }
-
     desc = [
-        "• Transaccion_ID se preserva completo (string + strip), sin recortes.",
-        "• Normalización de Recomienda_Marca y Ticket_Soporte (boolean).",
-        "• NPS se redondea opcionalmente y se categoriza en muy_negativo/neutral/positivo/excelente.",
-        "• Flags se calculan; NO eliminan por defecto. Excluyes solo al aplicar.",
-        f"• Estrategia de JOIN: {fb_strategy} (1:1 si se agrega).",
+        "Transaccion_ID se preserva completo (string + strip), sin recortes.",
+        "Normalización de Recomienda_Marca y Ticket_Soporte (boolean).",
+        "NPS se redondea opcionalmente y se categoriza en muy_negativo/neutral/positivo/excelente.",
+        "Flags se calculan; NO eliminan por defecto. Excluyes solo al aplicar.",
+        f"Estrategia de JOIN: {fb_strategy} (1:1 si se agrega).",
     ]
 
     return df_raw, fb, fb_final, fb_rare, fb_for_join, flag_cols, text_changes, cleaned_cols, original_cols, desc
@@ -795,7 +772,6 @@ inv_raw_out, inv_clean, inv_final, inv_rare, inv_flags, inv_text_changes, inv_cl
 tx_raw_out, tx_clean, tx_final, tx_rare, tx_flags, tx_text_changes, tx_cleaned_cols, tx_original_cols, tx_desc = process_transacciones(tx_raw)
 fb_raw_out, fb_clean, fb_final, fb_rare, fb_for_join, fb_flags, fb_text_changes, fb_cleaned_cols, fb_original_cols, fb_desc = process_feedback(fb_raw)
 
-# Sidebar bullets
 st.sidebar.markdown("### Inventario")
 st.sidebar.markdown("\n".join([f"• {x}" for x in inv_desc]))
 st.sidebar.markdown("### Transacciones")
@@ -816,7 +792,7 @@ st.markdown("## 3) Feedback")
 render_dataset("Feedback", fb_raw_out, fb_clean, fb_final, fb_rare, fb_flags, fb_text_changes, fb_cleaned_cols, fb_original_cols, "fb")
 
 # =========================
-# JOIN FINAL + lógica pedida de "match ciudad por costo" después del join
+# JOIN FINAL + lógica de "match ciudad por costo" después del join
 # =========================
 st.markdown("## 4) Join final + correcciones post-join")
 
@@ -838,7 +814,6 @@ with st.sidebar.expander("🔗 Join — opciones post-join", expanded=True):
     )
 
 # Normalizar IDs para join
-# SKU_ID y Transaccion_ID como string
 if "SKU_ID" in inv_final.columns:
     invj = inv_final.copy()
     invj["SKU_ID"] = invj["SKU_ID"].astype("string").str.strip()
@@ -861,7 +836,6 @@ else:
 
 fbj = fb_for_join.copy()
 if "Transaccion_ID_clean" in fbj.columns:
-    # si se agrego por transaccion_id_clean
     fbj = fbj.rename(columns={"Transaccion_ID_clean": "Transaccion_ID"})
 if "Transaccion_ID" in fbj.columns:
     fbj["Transaccion_ID"] = fbj["Transaccion_ID"].astype("string").str.strip()
@@ -882,7 +856,6 @@ joined["Ciudad_inferida_por_costo"] = np.nan
 joined["flag__ciudad_inferida_por_costo"] = False
 
 if enable_city_by_cost and ("Costo_Envio" in joined.columns) and ("Ciudad_Destino_clean" in joined.columns):
-    # Construir tabla de lookup: por costo exacto, ciudad más frecuente (excluyendo unknown)
     valid = joined[["Costo_Envio", "Ciudad_Destino_clean"]].copy()
     valid = valid[valid["Costo_Envio"].notna()]
     valid = valid[valid["Ciudad_Destino_clean"].notna()]
@@ -890,46 +863,35 @@ if enable_city_by_cost and ("Costo_Envio" in joined.columns) and ("Ciudad_Destin
 
     if len(valid) > 0:
         freq = valid.groupby(["Costo_Envio", "Ciudad_Destino_clean"]).size().reset_index(name="n")
-        # ciudad top por costo
         freq = freq.sort_values(["Costo_Envio", "n"], ascending=[True, False])
-        top = freq.groupby("Costo_Envio").head(2)  # top 2 para decidir unicidad
+        top = freq.groupby("Costo_Envio").head(2)
 
-        # construir dict solo si top1 es suficientemente dominante y único
         city_by_cost = {}
-        grouped = top.groupby("Costo_Envio")
-        for cost, g in grouped:
+        for cost, g in top.groupby("Costo_Envio"):
             g = g.sort_values("n", ascending=False)
             if len(g) == 1:
                 if int(g.iloc[0]["n"]) >= int(min_support):
-                    city_by_cost[cost] = (g.iloc[0]["Ciudad_Destino_clean"], int(g.iloc[0]["n"]), 0)
+                    city_by_cost[cost] = g.iloc[0]["Ciudad_Destino_clean"]
             else:
                 top1 = g.iloc[0]
                 top2 = g.iloc[1]
                 if int(top1["n"]) >= int(min_support) and int(top1["n"]) > int(top2["n"]):
-                    city_by_cost[cost] = (top1["Ciudad_Destino_clean"], int(top1["n"]), int(top2["n"]))
+                    city_by_cost[cost] = top1["Ciudad_Destino_clean"]
 
-        # aplicar a filas con ciudad unknown
-        unknown_mask = joined["Ciudad_Destino_clean"].astype("string") == "unknown"
+        unknown_mask = (joined["Ciudad_Destino_clean"].astype("string") == "unknown").fillna(False)
         cost_mask = joined["Costo_Envio"].notna()
-        target = joined[unknown_mask & cost_mask].copy()
+        target_idx = joined[unknown_mask & cost_mask].index
 
-        inferred = []
-        for idx, row in target.iterrows():
-            c = row["Costo_Envio"]
+        for idx in target_idx:
+            c = joined.at[idx, "Costo_Envio"]
             if c in city_by_cost:
-                inferred_city = city_by_cost[c][0]
-                inferred.append((idx, inferred_city))
-        for idx, city in inferred:
-            joined.loc[idx, "Ciudad_inferida_por_costo"] = city
-            joined.loc[idx, "flag__ciudad_inferida_por_costo"] = True
-            if overwrite_unknown_city:
-                joined.loc[idx, "Ciudad_Destino_clean"] = city
+                joined.at[idx, "Ciudad_inferida_por_costo"] = city_by_cost[c]
+                joined.at[idx, "flag__ciudad_inferida_por_costo"] = True
+                if overwrite_unknown_city:
+                    joined.at[idx, "Ciudad_Destino_clean"] = city_by_cost[c]
 
-# =========================
 # UI Join
-# =========================
 jtabs = st.tabs(["📋 Auditoría Join", "🚩 Flags Join (ejemplos)", "🧩 Dataset Join", "🧠 Diagnóstico inferencia ciudad"])
-
 join_flags = [c for c in joined.columns if c.startswith("flag__")]
 
 with jtabs[0]:
@@ -958,5 +920,5 @@ with jtabs[2]:
 
 with jtabs[3]:
     st.caption("Solo aplica a filas donde Ciudad_Destino_clean era unknown y se intentó inferir por Costo_Envio.")
-    cols = [c for c in ["Transaccion_ID","Costo_Envio","Ciudad_Destino_clean","Ciudad_inferida_por_costo","flag__ciudad_inferida_por_costo"] if c in joined.columns]
+    cols = [c for c in ["Transaccion_ID", "Costo_Envio", "Ciudad_Destino_clean", "Ciudad_inferida_por_costo", "flag__ciudad_inferida_por_costo"] if c in joined.columns]
     st.dataframe(joined[joined["flag__ciudad_inferida_por_costo"] == True][cols].head(300), use_container_width=True)
